@@ -94,6 +94,11 @@ calls, and the architecture fights for every call:
   ambiguous, so once a file has answered anywhere, its windows get re-swept in
   pieces small enough to be read. Files nothing in are never swept twice.
   `--dump-prompt` prints the exact instructions + prompt behind every call.
+- **Degenerate-answer detector:** if a file answers yes on more than 8% of its
+  lines, fmgrep says so on stderr instead of letting you scroll. On code that is
+  genuinely about one subject (`_sleep()` for a query about giving up waiting)
+  the model will do exactly that - 102 lines of 700, 22 of them real - and the
+  honest move is to name it and point at `-E` / `--top N`.
 
 ## What the honesty layer is for
 

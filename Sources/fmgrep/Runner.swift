@@ -102,6 +102,8 @@ actor Sink {
 
     /// Report one block verdict. Returns false when the file should stop
     /// evaluating its remaining blocks.
+    func hitCount(_ fileID: Int) -> Int { counts[fileID] ?? 0 }
+
     func report(_ verdict: MatchVerdict, block: Block, display: String, scores: [Int: Int] = [:]) -> Bool {
         var verdict = verdict
         if verdict.isMatch, verdict.confidence < (options.minConfidence ?? 1) {
@@ -266,6 +268,23 @@ actor CollapseGuard {
     private(set) var reswept = 0
     private(set) var resweepCalls = 0
     func resweep(windows: Int, calls: Int) { reswept += windows; resweepCalls += calls }
+
+    /// Files whose answer set is a large fraction of the file. That is not a
+    /// search result, it is the file: the model has judged the whole thing to be
+    /// about the query, which on code that is genuinely about one subject
+    /// (`_sleep()` for a query about giving up waiting) is what it will do.
+    /// Saying so is the only honest remaining move - see the run summary.
+    func observe(file: String, hits: Int, lines: Int) {
+        seen[file] = (hits, lines)
+    }
+    private var seen: [String: (hits: Int, lines: Int)] = [:]
+    func degenerate(minShare: Double = 0.08, minHits: Int = 12) -> [(file: String, hits: Int, lines: Int)] {
+        seen.compactMap { name, v -> (String, Int, Int)? in
+            guard v.lines > 40, v.hits >= minHits,
+                  Double(v.hits) / Double(v.lines) >= minShare else { return nil }
+            return (name, v.hits, v.lines)
+        }.sorted { $0.1 > $1.1 }
+    }
     func report() -> (windows: Int, extraCalls: Int, confirmed: Int, reswept: Int, resweepCalls: Int) { (windows, extraCalls, confirmed, reswept, resweepCalls) }
 }
 
@@ -563,12 +582,14 @@ func processFile(
 
         var silent: [[(number: Int, text: String)]] = []
         var fileLive = false
+        var judgedLines = Set<Int>()
 
         /// Print the lines of one judged window, and remember whether the window
         /// said anything at all.
         func reportWindow(_ judged: [(pos: Int, score: Int, reason: String)],
                           _ entries: [(number: Int, text: String)]) async -> Bool {
             if judged.contains(where: { $0.score > 0 }) { fileLive = true }
+            for e in entries { judgedLines.insert(e.number) }
             var scores: [Int: Int] = [:]
             var reason = ""
             var quiet: [(line: Int, score: Int)] = []
@@ -639,6 +660,9 @@ func processFile(
             await guard_.resweep(windows: silent.count, calls: extra)
         }
 
+        await guard_.observe(file: spec.display,
+                             hits: await sink.hitCount(spec.id),
+                             lines: judgedLines.count)
         await dumpNotes()
         return
     }
@@ -804,6 +828,11 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
 
     if settled.engine != .blocks {
         let g = await guard_.report()
+        let dull = await guard_.degenerate()
+        if !dull.isEmpty {
+            let worst = dull.prefix(3).map { "\($0.file.split(separator: "/").last.map(String.init) ?? $0.file) \($0.hits)/\($0.lines) lines" }.joined(separator: ", ")
+            FileHandle.standardError.write("fmgrep: note: \(dull.count) file(s) answered yes on >8% of their lines (\(worst)) - that is the model calling the whole file relevant, not a result set. Scope with -E, or read --top N.\n".data(using: .utf8)!)
+        }
         if g.reswept > 0 {
             FileHandle.standardError.write("fmgrep: recall guard: \(g.reswept) windows in matched files re-swept smaller (+\(g.resweepCalls) calls); --no-recall-sweep to skip\n".data(using: .utf8)!)
         }
