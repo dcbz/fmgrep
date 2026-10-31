@@ -1,0 +1,8 @@
+.build/
+*.o
+.DS_Store
+# local editor / harness state, not part of the tool
+*.swp
+.nodeterm/
+Package.resolved
+compile_commands.json
