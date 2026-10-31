@@ -45,12 +45,17 @@ Like grep: give it files (`-r` for directories) or pipe stdin, get
 | `-E REGEX`, `--prefilter` | **hybrid mode:** runs/blocks whose text misses REGEX are dropped before the model sees them, and `-E` also gates triage (path + declarations miss the regex ⇒ file skipped, no model call). `--no-triage` restores exhaustive `-E` |
 | `--expand` | ask the model for candidate keywords and filter with them (opt-in: fast, recall capped by the guesses) |
 | `--top N` | buffer every hit, print the best N ranked by model confidence — right mode for big corpora where streaming just prints whatever finished first |
-| `--score` (default) | engine: 32 consecutive lines per call, one yes/no **per line** — line-grade precision at 1/32 the calls |
-| `--line` | engine: strictly one call per line; the most accurate, the slowest. Small files only |
+| (default) | engine: 32 consecutive lines per call as a **sieve**, then every line the batch vouches for is judged again alone before it is printed — line-grade answers at roughly 1/10 the calls |
+| `--line` | engine: strictly one call per line, nothing batched; the accuracy baseline, ~0.7–1 s/line |
+| `--score` | engine: batched arrays with **no** per-line confirmation — cheap, and measurably looser (`--no-confirm` does the same on the default engine) |
 | `--blocks` | engine: the coarse original (find relevant lines per ~80-line window); fastest, lowest precision |
 | `--min-confidence 0..2` | emit lines the model scores ≥ N. Line engines score each line 0/1/2 (2 = clearly matches — **the default**, 1 = maybe); `--blocks` defaults to 1. Drop to 1 for maximum recall |
 | `--no-symbols` | disable declaration-aligned blocks and the location/outline context lines (on by default; the cheap 80% of what an LSP knows — see below) |
 | `--verify` | re-check every candidate line with a second model call (cuts noise, but the small model also prunes true hits; off by default) |
+| `--no-confirm` | trust batched YES answers instead of re-judging each one alone (faster, prints more noise) |
+| `--matched-chunk N` | batch size for files where `-E` matches a lot of lines (1–16, default 8 — longer arrays are where the 3B model stops reading) |
+| `--no-cache` | judge verbatim-duplicate lines separately instead of once per scan (the cache is why a license banner in 300 files costs one call) |
+| `--debug` | force one call per line and print WHY: the score and the model's own reason under every hit, plus every score-1 line the threshold suppressed, to stderr |
 | `--explain` | print the model's one-line reason under each hit |
 | `--json` | JSONL output: file, line, text, quote, reason, query |
 | `-j N` | concurrent model requests (default 3) |
@@ -72,9 +77,39 @@ calls, and the architecture fights for every call:
 - **Planner tiers (when `-E` is given):** <=48 hits per file: one call per
   line; many hits: matched lines batched in arrays of 8 (longer arrays
   measured to collapse); zero hits in short files: swept anyway; long
-  files skipped with a count. Without `-E`: straight batched sweeps of
-  everything at an honest printed price.
+  files skipped with a count. Without `-E`: batched sweeps of everything,
+  each batched yes confirmed per line, at an honest printed price.
 - **Triage (automatic):** multi-run files screened by path + declarations.
+- **Free filters before any model call:** lines with control or replacement
+  characters, or more than 60% non-ASCII, are skipped as content-free; and
+  syntax, never vocabulary, drops `goto` labels, brace-only lines and the
+  comma-tails of multi-line signatures — those are lines that cannot be a
+  place where something *happens*.
+- **Collapse guard:** if a batch answers "hit" on 90%+ of a long window it
+  did not read that window, so the window is re-judged in quarters. Reported
+  on stderr as `collapse guard: N uniform batches re-judged finer`.
+
+## What the honesty layer is for
+
+Measured on `bsd/kern/kern_synch.c` (the `_sleep()` implementation, so nearly
+every line is *about* waiting — a worst case) with the query "places where the
+code gives up waiting because the resource it needs is no longer available":
+
+| configuration | lines printed |
+|---|---|
+| batched arrays only | 69 |
+| + per-line confirmation of each batched yes | 41 |
+| + tightened judging instructions | 55 |
+| + structural filters (labels, signature tails) | 42 |
+
+The true sites are all there (`thread_should_abort()` at 239/294/304,
+`case THREAD_TIMED_OUT:`, the `error = EINTR / ERESTART` returns), and so is
+noise the model genuinely believes: `if (spinmutex) {`, `int flags;`,
+`break;`. That is the honest shape of a 3B judge on topically saturated code —
+`--debug` exists so you can see which of those you are looking at, and
+`--min-confidence 1` trades this precision for recall. Judging was never the
+weak link in these runs: the shipping layer (batching) was, which is why the
+default now confirms before it prints.
 
 Workflow that stays sane on a kernel tree:
 
