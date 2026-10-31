@@ -54,6 +54,7 @@ Like grep: give it files (`-r` for directories) or pipe stdin, get
 | `--verify` | re-check every candidate line with a second model call (cuts noise, but the small model also prunes true hits; off by default) |
 | `--no-confirm` | trust batched YES answers instead of re-judging each one alone (faster, prints more noise) |
 | `--no-recall-sweep` | do not re-sweep a matched file's windows in smaller pieces (cheaper, loses the lines a long array stops reading) |
+| `--rerank` | **off by default, measured negative**: one extra call per window asking the model which of its own candidates ARE answers. It trades 91% recall for 33%→50% precision (F1 0.487 → 0.476) because the 3B model looks at ten parallel true sites and keeps one |
 | `--dump-prompt` | print the exact instructions + prompt sent for every model call |
 | `--matched-chunk N` | batch size for files where `-E` matches a lot of lines (1–16, default 8 — longer arrays are where the 3B model stops reading) |
 | `--no-cache` | judge verbatim-duplicate lines separately instead of once per scan (the cache is why a license banner in 300 files costs one call) |
@@ -99,6 +100,42 @@ calls, and the architecture fights for every call:
   genuinely about one subject (`_sleep()` for a query about giving up waiting)
   the model will do exactly that - 102 lines of 700, 22 of them real - and the
   honest move is to name it and point at `-E` / `--top N`.
+
+## Accuracy, measured rather than asserted
+
+`Tests/accuracy.sh` runs two hand-verified answer sets (needs `XNU=/path/to/xnu`)
+and prints recall/false-positives/precision, so a change that quietly trades
+recall for a prettier number gets caught:
+
+```console
+vm_kern dealloc        hits=11   recall=11/11  false-positives=0  precision=100%
+kern_synch abort paths hits=19   recall=8/11   false-positives=11 precision=42%
+```
+
+Case 1 is a verb-to-identifier gap (`grep deallocate` cannot express the query,
+`-E deallocate` here is only a scoping aid). Case 2 is the hard one: `_sleep()`'s
+own file, where every line is topically adjacent. The levers that moved it, and
+what each cost:
+
+| lever | recall | false positives |
+|---|---|---|
+| batched sieve only | 5/11 | 12 |
+| + per-line confirmation, verdict cache keyed on line **and surroundings** | 5/11 | 10 |
+| + outcome-assignment carve-out in the judging rules | 10/11 | 20 |
+| + structural filter (preprocessor, operand-free `break;`, `__attribute__` lines) | 10/11 | 11 |
+
+The carve-out is the interesting one: `error = EINTR;` **is** the answer to
+"gives up waiting", and the first pass had been demoting it to "state
+bookkeeping" — a rule written to improve precision that was silently deleting
+the true hits. Restating it (`an assignment that decides the outcome the query
+asks about is the place it happens`) doubled recall. The structural filter then
+removed a third of the noise for free, because those lines cannot express
+anything: they are the same kind of rule as the brace-only filter, just
+unfinished.
+
+Numbers move by a line or two run to run — the same prompt on the same binary
+scored 10/11 and 8/11 on the two runs above. `--debug` prints the score-1 lines
+it dropped, which is where the difference lives.
 
 ## What the honesty layer is for
 

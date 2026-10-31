@@ -45,6 +45,8 @@ struct Options {
     var cache = true               // identical line text judged once per scan
     var confirm = true             // batched YES answers get re-judged alone
     var recallSweep = true         // silent windows in a live file get re-swept smaller
+    var rerank = false             // opt-in comparative gate; measured to cost more recall
+                                   // than precision on real code, so it is not the default
     var dumpPrompt = false         // print the exact prompt for each model call
     var top = 0                    // >0: buffer all hits, print best N by score
     var verify = false             // opt-in per-line re-check; prunes noise but also true hits (3B model)
@@ -123,6 +125,8 @@ struct Options {
                 case "no-confirm": o.confirm = false
                 case "dump-prompt": o.dumpPrompt = true
                 case "no-recall-sweep": o.recallSweep = false
+                case "rerank": o.rerank = true
+                case "no-rerank": o.rerank = false
                 case "no-verify": o.verify = false
                 case "scratchpad": o.scratchpad = true
                 case "no-scratchpad": o.scratchpad = false
@@ -237,7 +241,15 @@ func printUsage() {
                                 memory-allocation match). Trustworthy for prose,
                                 not for kernels.
           --blocks              coarse windows, ~80 lines each (legacy)
-              --no-recall-sweep     do not re-sweep windows that reported nothing
+              --rerank              one extra call per window: show the model its own
+                                candidates together and ask which ones ARE answers.
+                                OFF by default because it was measured negative - on
+                                kern_synch it traded 91% recall for 33%->50% precision
+                                (F1 0.487 -> 0.476): the 3B model reads a list of true
+                                parallel sites and keeps only one of them. --no-rerank
+                                is the default behaviour; use --rerank when a file is
+                                so saturated you would rather skim 7 lines than 37
+          --no-recall-sweep     do not re-sweep windows that reported nothing
                                 (default: a 32-line array that says "no" everywhere is
                                 ambiguous - unread array or genuinely empty stretch -
                                 so in a file that matched elsewhere it gets swept again

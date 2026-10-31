@@ -269,6 +269,10 @@ actor CollapseGuard {
     private(set) var resweepCalls = 0
     func resweep(windows: Int, calls: Int) { reswept += windows; resweepCalls += calls }
 
+    private(set) var kept = 0
+    private(set) var dropped = 0
+    func rerank(kept: Int, dropped: Int) { self.kept += kept; self.dropped += dropped }
+
     /// Files whose answer set is a large fraction of the file. That is not a
     /// search result, it is the file: the model has judged the whole thing to be
     /// about the query, which on code that is genuinely about one subject
@@ -285,7 +289,7 @@ actor CollapseGuard {
             return (name, v.hits, v.lines)
         }.sorted { $0.1 > $1.1 }
     }
-    func report() -> (windows: Int, extraCalls: Int, confirmed: Int, reswept: Int, resweepCalls: Int) { (windows, extraCalls, confirmed, reswept, resweepCalls) }
+    func report() -> (windows: Int, extraCalls: Int, confirmed: Int, reswept: Int, resweepCalls: Int, kept: Int, dropped: Int) { (windows, extraCalls, confirmed, reswept, resweepCalls, kept, dropped) }
 }
 
 /// Lines that are structurally incapable of being a place where something
@@ -294,6 +298,26 @@ actor CollapseGuard {
 /// bias the search toward words the query happens to contain.
 func isStructuralTail(_ text: String, depthBefore: Int) -> Bool {
     let t = text.trimmingCharacters(in: .whitespaces)
+    // Preprocessor directives: nothing happens on these lines. `#define` stays
+    // judgeable because it really does declare the thing a query can ask about.
+    if t.hasPrefix("#"), !t.dropFirst().trimmingCharacters(in: .whitespaces).hasPrefix("define") {
+        return true
+    }
+    // Control statements with no operands say nothing about any topic.
+    for bare in ["break;", "break", "continue;", "continue", "fallthrough;", "OS_FALLTHROUGH;",
+                 "OS_FALLTHROUGH"] where t.caseInsensitiveCompare(bare) == .orderedSame {
+        return true
+    }
+    // Annotation-only lines: `__attribute__((noreturn))`, `@available(...)`.
+    // The double paren is what keeps a real call like `kfree(ptr);` judgeable.
+    if t.range(of: #"^[A-Za-z_]\w*\(\(.*\)\);?$"#, options: .regularExpression) != nil,
+       !t.contains("=") {
+        return true
+    }
+    if t.range(of: #"^@?[A-Za-z_@$][\w$]*\([\w :,.*"]*\)[;]?$"#, options: .regularExpression) != nil,
+       t.first == "@" {
+        return true
+    }
     // braces / `else` with no statement in them
     let bracesOnly = t.replacingOccurrences(of: "[{}()\\[\\];]", with: "", options: .regularExpression)
         .replacingOccurrences(of: "\\belse\\b", with: "", options: .regularExpression)
@@ -335,6 +359,19 @@ func parenDepth(_ lines: [String], before i: Int) -> Int {
         j += 1
     }
     return max(0, d)
+}
+
+/// The nearest non-blank line before (delta -1) or after (delta +1) a line,
+/// trimmed for a cache key. Same idea as the context block in the prompt: the
+/// identity of a verdict includes where it was read.
+func neighborText(_ lines: [String], _ line: Int, _ delta: Int) -> String {
+    var i = line + delta
+    while i >= 1, i <= lines.count {
+        let t = lines[i - 1].trimmingCharacters(in: .whitespaces)
+        if !t.isEmpty { return String(t.prefix(80)) }
+        i += delta
+    }
+    return ""
 }
 
 func regexHit(_ text: String, _ re: NSRegularExpression) -> Bool {
@@ -534,7 +571,12 @@ func processFile(
                     }
                     return []
                 }
-                key += " @" + scopeAt(ln)
+                // The verdict was produced FROM the surroundings, so it is keyed
+                // on them: `error = EINTR;` appears five times in this one
+                // function and the lines around it are what make each answer
+                // different. Keying on the text alone let one answer stand in
+                // for all five, which looked exactly like random recall loss.
+                key += " @" + scopeAt(ln) + " ~" + neighborText(file.lines, ln, -1) + "|" + neighborText(file.lines, ln, 1)
                 if options.cache, let c = await cache.lookup(key) {
                     return [(offset, c.score, c.reason + " [cached]")]
                 }
@@ -593,7 +635,7 @@ func processFile(
             var scores: [Int: Int] = [:]
             var reason = ""
             var quiet: [(line: Int, score: Int)] = []
-            let hits = judged.compactMap { v -> Int? in
+            var hits = judged.compactMap { v -> Int? in
                 let text = entries[v.pos].text
                 guard text.rangeOfCharacter(from: .alphanumerics) != nil else { return nil }
                 reason = v.reason
@@ -603,6 +645,38 @@ func processFile(
                 }
                 if options.debug, v.score >= 1 { quiet.append((entries[v.pos].number, v.score)) }
                 return nil
+            }
+
+            // Comparative gate. Two or more candidates inside one window is the
+            // case independent judging structurally cannot see: each was scored
+            // alone and all of them came back "yes". Shown together, the model
+            // can rank them, so the window's answer set gets one more call.
+            // A refusal here keeps every candidate - the gate only subtracts
+            // when it actually managed to read the list.
+            if options.rerank, hits.count >= 2 {
+                let cands = hits.map { (entries[$0 - 1].number, entries[$0 - 1].text) }
+                await semaphore.wait()
+                let sel: Selection?
+                do {
+                    sel = try await selectBest(cands, fileDisplay: spec.display,
+                                               query: options.query,
+                                               scope: scopeAt(entries.first?.number ?? 1))
+                } catch {
+                    sel = nil
+                }
+                await semaphore.signal()
+                if let sel, !sel.keep.isEmpty || cands.count <= 3 {
+                    let keep = Set(sel.keep)
+                    let dropped = hits.filter { !keep.contains(entries[$0 - 1].number) }
+                    hits.removeAll { !keep.contains(entries[$0 - 1].number) }
+                    for pos in dropped { scores.removeValue(forKey: pos) }
+                    await guard_.rerank(kept: hits.count, dropped: dropped.count)
+                    if options.debug {
+                        for pos in dropped {
+                            await sink.warn("[debug] \(spec.display):\(entries[pos - 1].number): candidate dropped by the comparative pass - \(sel.reason)")
+                        }
+                    }
+                }
             }
             for (line, sc) in quiet {
                 let why = judged.first { entries[$0.pos].number == line }?.reason ?? ""
@@ -828,6 +902,10 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
 
     if settled.engine != .blocks {
         let g = await guard_.report()
+        let gk = await guard_.report()
+        if gk.dropped > 0 {
+            FileHandle.standardError.write("fmgrep: comparative pass: kept \(gk.kept), dropped \(gk.dropped) candidates that were only next to the topic (--no-rerank to print them all)\n".data(using: .utf8)!)
+        }
         let dull = await guard_.degenerate()
         if !dull.isEmpty {
             let worst = dull.prefix(3).map { "\($0.file.split(separator: "/").last.map(String.init) ?? $0.file) \($0.hits)/\($0.lines) lines" }.joined(separator: ", ")

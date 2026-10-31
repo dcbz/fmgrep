@@ -326,8 +326,12 @@ shown. Judge the line in your hand, never on what a neighbor probably says, \
 and never on incidental word overlap. Never award 2 just because the line \
 mentions a type, flag or variable connected to the topic, or because the \
 file as a whole is about it: declarations, #include lines, one parameter of \
-a multi-line signature, labels, and plain state bookkeeping score 1 at best \
-unless the query is about that bookkeeping itself. Legal boilerplate, copyright notices and \
+a multi-line signature, labels, and housekeeping that merely parks a value \
+for later (clearing a pointer, setting a flag) score 1 at best unless the \
+query is about that housekeeping itself. But an assignment that \
+DECIDES the outcome the query asks about - the error, status or result a \
+wait or allocation ends with - is the place it happens, and scores 2 even \
+though it looks like a plain statement. Legal boilerplate, copyright notices and \
 license banners are never matches unless they state the query's technical \
 concept.
 """
@@ -345,6 +349,59 @@ genuinely useful - never an opinion about what matched, and the empty string \
 if nothing new.
 """
 let annotatedRunGuidance = notedRunGuidance + " Keep reason to one short clause supporting the matches."
+
+@Generable
+struct Selection {
+    @Guide(description: "the numbers of the listed lines that really answer the query, taken from the numbers shown at the start of each line; leave empty if none of them do")
+    var keep: [Int]
+    @Guide(description: "one short clause naming what was dropped and why")
+    var reason: String
+}
+
+/// A cheap first pass flags generously - independent 0/1/2 judging has no way
+/// to notice that thirty lines in one function all got a 2. This puts the
+/// candidates in front of the model together and asks which ones ARE the
+/// answer, which is a comparison the per-line call structurally cannot make.
+let selectionInstructions = """
+You are the final gate of fmgrep, a semantic search tool. A cheap first pass \
+flagged the lines below as candidates for a query; it flags generously, so some \
+of them are only next to the topic instead of answers to it. Keep every line \
+that is itself a place the query is about, and drop the rest, under two rules.
+(1) A search returns ALL the places, so ten lines that each satisfy the query \
+are ten answers - never drop one because another candidate says the same thing \
+in the same function, that is the result rather than a duplicate. (2) Judge \
+each line against the query on its own; comparing candidates with each other is \
+not your job. Drop a line only when it is not itself a place where the query's \
+thing happens: a declaration, a comment, housekeeping that parks a value for \
+later, or a check whose subject is a different topic. (3) An assignment that
+DECIDES the outcome the query asks about - the error, status or result a wait
+or allocation ends with - is an answer even though it looks like a plain
+statement; keeping one such line does not license dropping the others.
+"""
+
+func selectBest(
+    _ entries: [(number: Int, text: String)],
+    fileDisplay: String,
+    query: String,
+    scope: String
+) async throws -> Selection {
+    var body = ""
+    for e in entries { body += "\(e.number): \(String(e.text.prefix(600)))\n" }
+    let prompt = """
+    Query: \(query)
+    Candidates from \(fileDisplay)\(scope.isEmpty ? "" : " (\(scope))"), in file order:
+
+    \(body)
+    Which of these lines ARE the answer to the query? List their numbers; drop the ones that are only adjacent to the topic.
+    """
+    let session = LanguageModelSession(instructions: Instructions(selectionInstructions))
+    let response = try await session.respond(
+        to: prompt,
+        generating: Selection.self,
+        options: GenerationOptions(temperature: 0.0, maximumResponseTokens: 160 + entries.count * 3)
+    )
+    return response.content
+}
 
 /// Judge a run of lines in one call. answers[i] corresponds to lines[i];
 /// a short answer array is padded with 0 (conservative).
