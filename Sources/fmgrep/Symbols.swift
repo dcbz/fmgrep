@@ -38,15 +38,35 @@ enum Symbols {
         func re(_ p: String) -> NSRegularExpression? {
             try? NSRegularExpression(pattern: p)
         }
+        // C: ANSI (`int foo(void) {`) and K&R (`foo(` at end of line, args
+        // below) definitions, plus aggregate types. Missing this case meant a
+        // .c file had no symbol map at all, which silently switched off the
+        // location line in the judging prompt, declaration-aligned blocks and
+        // triage-by-declarations across an entire kernel corpus.
+        let cFamily: [Decl] = [
+            // Kernel style: the return type sits on the previous line, so the
+            // definition is just `name(` at end of line.
+            Decl(re: re(#"^([a-z_]\w*)\s*\($"#)!, kindGroup: nil, nameGroups: [1], fixedKind: "fn"),
+            // `int foo(int x)` / `int foo(` with the type inline. The bare-name
+            // form above cannot be expressed with the `[A-Za-z_][\w ]*\b(name)`
+            // idiom, which only matches when a space separates type and name.
+            Decl(re: re(#"^\s*(?:static\s+|inline\s+|extern\s+|__private_extern__\s+)*[A-Za-z_][\w \*]*\s+([a-z_]\w*)\s*\([^;]*?\)\s*\{"#)!, kindGroup: nil, nameGroups: [1], fixedKind: "fn"),
+            Decl(re: re(#"^\s*(?:static\s+|inline\s+|extern\s+|__private_extern__\s+)*[A-Za-z_][\w \*]*\s+([a-z_]\w*)\s*\([^;]*\)$"#)!, kindGroup: nil, nameGroups: [1], fixedKind: "fn"),
+            Decl(re: re(#"^(?:typedef\s+)?(struct|union|enum)\s+([a-z_]\w*)\s*(?:__attribute__\(\([^)]*\)\)\s*)?\{"#)!, kindGroup: 1, nameGroups: [2], fixedKind: ""),
+        ]
+        let objc: [Decl] = [
+            Decl(re: re(#"@(implementation|interface)\s+([A-Za-z_]\w*)"#)!, kindGroup: 1, nameGroups: [2], fixedKind: ""),
+            Decl(re: re(#"^\s*[-+]\s*\([^)]*\)\s*([A-Za-z_]\w*)"#)!, kindGroup: nil, nameGroups: [1], fixedKind: "method"),
+        ]
         switch ext.lowercased() {
         case "swift":
             return [Decl(re: re(#"^\s*(?:(?:public|private|internal|fileprivate|open|static|final|override|convenience|required|class|actor)\s+)*(?:@\w+\s+)*(func|var|let|struct|enum|protocol|extension|init|subscript)\s+([A-Za-z_$][\w$]*)"#)!, kindGroup: 1, nameGroups: [2], fixedKind: "")]
-        case "m", "mm", "h":
-            return [
-                Decl(re: re(#"@(implementation|interface)\s+([A-Za-z_]\w*)"#)!, kindGroup: 1, nameGroups: [2], fixedKind: ""),
-                Decl(re: re(#"^\s*[-+]\s*\([^)]*\)\s*([A-Za-z_]\w*)"#)!, kindGroup: nil, nameGroups: [1], fixedKind: "method"),
-                Decl(re: re(#"^[A-Za-z_][\w \*\^]*\b([a-z_]\w*)\s*\([^;]*\)\s*\{"#)!, kindGroup: nil, nameGroups: [1], fixedKind: "fn"),
-            ]
+        case "m", "mm":
+            return objc + [Decl(re: re(#"^[A-Za-z_][\w \*\^]*\b([a-z_]\w*)\s*\([^;]*\)\s*\{"#)!, kindGroup: nil, nameGroups: [1], fixedKind: "fn")]
+        case "c":
+            return cFamily
+        case "h":
+            return cFamily + objc   // headers are C or Objective-C; try both
         case "py":
             return [Decl(re: re(#"^(\s*)(class|def)\s+([A-Za-z_]\w*)"#)!, kindGroup: 2, nameGroups: [3], fixedKind: "")]
         case "js", "ts", "jsx", "tsx":

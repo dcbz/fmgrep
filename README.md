@@ -53,6 +53,8 @@ Like grep: give it files (`-r` for directories) or pipe stdin, get
 | `--no-symbols` | disable declaration-aligned blocks and the location/outline context lines (on by default; the cheap 80% of what an LSP knows — see below) |
 | `--verify` | re-check every candidate line with a second model call (cuts noise, but the small model also prunes true hits; off by default) |
 | `--no-confirm` | trust batched YES answers instead of re-judging each one alone (faster, prints more noise) |
+| `--no-recall-sweep` | do not re-sweep a matched file's windows in smaller pieces (cheaper, loses the lines a long array stops reading) |
+| `--dump-prompt` | print the exact instructions + prompt sent for every model call |
 | `--matched-chunk N` | batch size for files where `-E` matches a lot of lines (1–16, default 8 — longer arrays are where the 3B model stops reading) |
 | `--no-cache` | judge verbatim-duplicate lines separately instead of once per scan (the cache is why a license banner in 300 files costs one call) |
 | `--debug` | force one call per line and print WHY: the score and the model's own reason under every hit, plus every score-1 line the threshold suppressed, to stderr |
@@ -88,6 +90,10 @@ calls, and the architecture fights for every call:
 - **Collapse guard:** if a batch answers "hit" on 90%+ of a long window it
   did not read that window, so the window is re-judged in quarters. Reported
   on stderr as `collapse guard: N uniform batches re-judged finer`.
+- **Recall guard (the mirror image):** a window's *silence* is equally
+  ambiguous, so once a file has answered anywhere, its windows get re-swept in
+  pieces small enough to be read. Files nothing in are never swept twice.
+  `--dump-prompt` prints the exact instructions + prompt behind every call.
 
 ## What the honesty layer is for
 
@@ -101,6 +107,22 @@ code gives up waiting because the resource it needs is no longer available":
 | + per-line confirmation of each batched yes | 41 |
 | + tightened judging instructions | 55 |
 | + structural filters (labels, signature tails) | 42 |
+
+Window size turns out to be a *recall* dial, not just a cost dial — same 128
+lines, same query, one run per sieve size:
+
+| lines per judging call | hits | model calls |
+|---|---|---|
+| 32 | 3 | 10 |
+| 16 | 14 | 24 |
+| 8 | 16 | 34 |
+| 4 | 19 | 51 |
+| one line per call | ~per-line floor | 128 |
+
+The model reads the head of a long array and drifts to "no" down the tail, so a
+32-line window quietly loses two thirds of the answers. That is what the recall
+guard buys back: files that answer nothing stay at 32 lines per call, files that
+answer something get swept again in windows of 8 (17 hits here for ~44 calls).
 
 The true sites are all there (`thread_should_abort()` at 239/294/304,
 `case THREAD_TIMED_OUT:`, the `error = EINTR / ERESTART` returns), and so is

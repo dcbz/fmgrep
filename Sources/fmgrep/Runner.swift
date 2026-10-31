@@ -76,6 +76,7 @@ actor Sink {
     private var announced: Set<Int> = []      // files already listed in -l mode
     private var hadMatch: Set<Int> = []
     private var counts: [Int: Int] = [:]
+    private var printedKeys: Set<String> = []   // fileID:line, for two-pass sweeps
     private var emittedLines = 0
     private var stopAll = false
     private var ranked: [ScoredMatch] = []    // buffered hits when --top is set
@@ -110,10 +111,13 @@ actor Sink {
         let lines = verdict.isMatch
             ? verdict.lineNumbers.filter { (1 ... block.lines.count).contains($0) }
             : []
+        // A coarse sieve plus a fine re-sweep can present one line twice; grep
+        // would print it once, so print it once.
+        let fresh = lines.filter { printedKeys.insert("\(block.fileID):\(block.start + $0 - 1)").inserted }
         if verdict.isMatch { hadMatch.insert(block.fileID) }
 
         if options.count {
-            counts[block.fileID, default: 0] += lines.count
+            counts[block.fileID, default: 0] += fresh.count
             return !stopAll
         }
 
@@ -137,7 +141,7 @@ actor Sink {
         }
 
         guard verdict.isMatch else { return true }
-        for local in lines {
+        for local in fresh {
             let n = block.start + local - 1
             let text = String(block.lines[block.lines.startIndex + (local - 1)])
             counts[block.fileID, default: 0] += 1
@@ -259,7 +263,10 @@ actor CollapseGuard {
     }
     private(set) var confirmed = 0
     func confirm() { confirmed += 1 }
-    func report() -> (windows: Int, extraCalls: Int, confirmed: Int) { (windows, extraCalls, confirmed) }
+    private(set) var reswept = 0
+    private(set) var resweepCalls = 0
+    func resweep(windows: Int, calls: Int) { reswept += windows; resweepCalls += calls }
+    func report() -> (windows: Int, extraCalls: Int, confirmed: Int, reswept: Int, resweepCalls: Int) { (windows, extraCalls, confirmed, reswept, resweepCalls) }
 }
 
 /// Lines that are structurally incapable of being a place where something
@@ -442,17 +449,31 @@ func processFile(
         /// One judging call: semaphore-gated, refusal-reported. nil = no verdict.
         /// The scope line tells the model which function it is looking at, which is
         /// what lets it tell a behavioural line from one parameter of a signature.
-        func callModel(_ entries: [(number: Int, text: String)], forced: RunMode? = nil) async -> RunResult? {
+        func scopeAt(_ line: Int) -> String {
+            options.symbols && !file.symbols.isEmpty ? Symbols.location(line, file.symbols) : ""
+        }
+        /// The lines around a candidate, for a call that judges one line.
+        func neighborhood(_ line: Int, radius: Int = 2) -> [(number: Int, text: String)] {
+            var out: [(number: Int, text: String)] = []
+            for n in max(1, line - radius) ... min(file.lines.count, line + radius) where n != line {
+                let t = file.lines[n - 1]
+                if !t.trimmingCharacters(in: .whitespaces).isEmpty, lineCacheKey(t) != nil {
+                    out.append((n, t))
+                }
+            }
+            return out
+        }
+        func callModel(_ entries: [(number: Int, text: String)], forced: RunMode? = nil,
+                       context: [(number: Int, text: String)] = []) async -> RunResult? {
             await semaphore.wait()
-            let scope = options.symbols && !file.symbols.isEmpty
-                ? Symbols.location(entries.first?.number ?? 1, file.symbols) : ""
+            let scope = scopeAt(entries.first?.number ?? 1)
             do {
                 let r = try await scoreEntries(
                     entries, fileDisplay: spec.display, totalLines: file.lines.count,
                     query: options.query,
                     instructions: lineInstructions,
                     mode: forced ?? ((options.explain || options.debug) ? .full : (notes != nil ? .noted : .lean)),
-                    notes: notes, scope: scope
+                    notes: notes, scope: scope, context: context
                 )
                 await semaphore.signal()
                 return r
@@ -488,16 +509,18 @@ func processFile(
                     }
                     return []
                 }
-                guard let key = lineCacheKey(entries[0].text) else {
+                guard var key = lineCacheKey(entries[0].text) else {
                     if options.debug {
                         await sink.warn("[debug] \(spec.display):\(entries[0].number): deterministic junk filter (control/mostly-non-ASCII chars)")
                     }
                     return []
                 }
+                key += " @" + scopeAt(ln)
                 if options.cache, let c = await cache.lookup(key) {
                     return [(offset, c.score, c.reason + " [cached]")]
                 }
-                guard let r = await callModel(entries, forced: checked ? .full : nil), let sc = r.answers.first else { return [] }
+                guard let r = await callModel(entries, forced: checked ? .full : nil,
+                                              context: neighborhood(ln)), let sc = r.answers.first else { return [] }
                 if options.cache { await cache.store(key, score: sc, reason: r.reason) }
                 return [(offset, sc, r.reason)]
             }
@@ -538,15 +561,17 @@ func processFile(
             return out
         }
 
-        for entries in chunks {
-            if Task.isCancelled { break }
-            if await sink.isDoneForFile(spec.id) { break }
-            if entries.allSatisfy({ $0.text.trimmingCharacters(in: .whitespaces).isEmpty }) { continue }
-            if let regex, plan != .lines, !entries.contains(where: { regexHit($0.text, regex) }) { continue }
+        var silent: [[(number: Int, text: String)]] = []
+        var fileLive = false
 
-            let judged = await resolve(entries, at: 0)
+        /// Print the lines of one judged window, and remember whether the window
+        /// said anything at all.
+        func reportWindow(_ judged: [(pos: Int, score: Int, reason: String)],
+                          _ entries: [(number: Int, text: String)]) async -> Bool {
+            if judged.contains(where: { $0.score > 0 }) { fileLive = true }
             var scores: [Int: Int] = [:]
             var reason = ""
+            var quiet: [(line: Int, score: Int)] = []
             let hits = judged.compactMap { v -> Int? in
                 let text = entries[v.pos].text
                 guard text.rangeOfCharacter(from: .alphanumerics) != nil else { return nil }
@@ -555,10 +580,12 @@ func processFile(
                     scores[v.pos + 1] = v.score
                     return v.pos + 1
                 }
-                if options.debug, v.score >= 1 {
-                    Task { await sink.warn("[debug] \(spec.display):\(entries[v.pos].number): score \(v.score), below threshold \(threshold) — \(v.reason)") }
-                }
+                if options.debug, v.score >= 1 { quiet.append((entries[v.pos].number, v.score)) }
                 return nil
+            }
+            for (line, sc) in quiet {
+                let why = judged.first { entries[$0.pos].number == line }?.reason ?? ""
+                await sink.warn("[debug] \(spec.display):\(line): score \(sc), below threshold \(threshold) - \(why)")
             }
             let block = Block(
                 fileID: spec.id,
@@ -569,9 +596,49 @@ func processFile(
                 isMatch: !hits.isEmpty, lineNumbers: hits, quote: "",
                 reason: reason, confidence: hits.isEmpty ? 0 : 2, note: ""
             )
-            let keepGoing = await sink.report(verdict, block: block, display: spec.display, scores: scores)
-            if !keepGoing { break }
+            return await sink.report(verdict, block: block, display: spec.display, scores: scores)
         }
+
+        for entries in chunks {
+            if Task.isCancelled { break }
+            if await sink.isDoneForFile(spec.id) { break }
+            if entries.allSatisfy({ $0.text.trimmingCharacters(in: .whitespaces).isEmpty }) { continue }
+            if let regex, plan != .lines, !entries.contains(where: { regexHit($0.text, regex) }) { continue }
+
+            let judged = await resolve(entries, at: 0)
+            if options.recallSweep, entries.count > options.matchedChunk {
+                silent.append(entries)
+            }
+            if !(await reportWindow(judged, entries)) { break }
+        }
+
+        // Recall guard. Measured on the same 128 lines: arrays of 32 report 3
+        // hits, of 16 -> 14, of 8 -> 16, of 4 -> 19. The model reads the head of
+        // a long array and drifts to "no" down the tail, so the missed lines are
+        // inside windows that already answered, not only in silent ones. Hence:
+        // sweep the whole file again in pieces small enough to be read - but only
+        // once the file has proved it is about something (any line scored > 0).
+        // Unrelated files cost nothing extra, and lines already confirmed alone
+        // come back from the verdict cache instead of the model.
+        if options.recallSweep, fileLive, !silent.isEmpty, !Task.isCancelled {
+            let step = options.debug ? 1 : options.matchedChunk
+            let planned = silent.reduce(0) { $0 + ($1.count + step - 1) / step }
+            FileHandle.standardError.write("fmgrep: recall guard: re-sweeping \(spec.display) in windows of \(step) (\(+planned) more calls)\n".data(using: .utf8)!)
+            var extra = 0
+            for window in silent {
+                if await sink.isDoneForFile(spec.id) || Task.isCancelled { break }
+                var i = 0
+                while i < window.count {
+                    let j = min(i + step, window.count)
+                    let piece = Array(window[i ..< j])
+                    extra += (piece.count + step - 1) / step
+                    if !(await reportWindow(await resolve(piece, at: 0), piece)) { break }
+                    i = j
+                }
+            }
+            await guard_.resweep(windows: silent.count, calls: extra)
+        }
+
         await dumpNotes()
         return
     }
@@ -714,6 +781,7 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
     let settled = options // freeze after downgrade/resolution so task closures capture an immutable copy
     let planDict = plan
     let patternStr = pattern
+    dumpPrompts = settled.dumpPrompt
     let matchTest = await interpretQuery(settled.query)   // one call per scan
     if settled.debug {
         FileHandle.standardError.write("fmgrep: debug: engine=line threshold=\(settled.minConfidence ?? 2) prefilter=\(patternStr ?? "(none)")\n       rule: \(matchTest.isEmpty ? "(none)" : matchTest)\n       hits annotated with scores; score-1 suppressions go to stderr\n".data(using: .utf8)!)
@@ -736,6 +804,9 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
 
     if settled.engine != .blocks {
         let g = await guard_.report()
+        if g.reswept > 0 {
+            FileHandle.standardError.write("fmgrep: recall guard: \(g.reswept) windows in matched files re-swept smaller (+\(g.resweepCalls) calls); --no-recall-sweep to skip\n".data(using: .utf8)!)
+        }
         if g.confirmed > 0 {
             FileHandle.standardError.write("fmgrep: \(g.confirmed) batched yes-answers re-judged alone (+\(g.confirmed) calls); --no-confirm to skip that check\n".data(using: .utf8)!)
         }

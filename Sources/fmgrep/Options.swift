@@ -44,6 +44,8 @@ struct Options {
     var matchedChunk = 8           // regex-matched lines judged per call (short arrays stay honest)
     var cache = true               // identical line text judged once per scan
     var confirm = true             // batched YES answers get re-judged alone
+    var recallSweep = true         // silent windows in a live file get re-swept smaller
+    var dumpPrompt = false         // print the exact prompt for each model call
     var top = 0                    // >0: buffer all hits, print best N by score
     var verify = false             // opt-in per-line re-check; prunes noise but also true hits (3B model)
     var debug = false              // per-line WHY: forces 1 line/call, prints score+reason per hit,
@@ -119,6 +121,8 @@ struct Options {
                 case "debug": o.debug = true
                 case "no-cache": o.cache = false
                 case "no-confirm": o.confirm = false
+                case "dump-prompt": o.dumpPrompt = true
+                case "no-recall-sweep": o.recallSweep = false
                 case "no-verify": o.verify = false
                 case "scratchpad": o.scratchpad = true
                 case "no-scratchpad": o.scratchpad = false
@@ -233,7 +237,14 @@ func printUsage() {
                                 memory-allocation match). Trustworthy for prose,
                                 not for kernels.
           --blocks              coarse windows, ~80 lines each (legacy)
-              --no-confirm          trust batched YES answers without a per-line re-check
+              --no-recall-sweep     do not re-sweep windows that reported nothing
+                                (default: a 32-line array that says "no" everywhere is
+                                ambiguous - unread array or genuinely empty stretch -
+                                so in a file that matched elsewhere it gets swept again
+                                in windows of --matched-chunk; unrelated files cost zero)
+          --dump-prompt         print the exact instructions + prompt behind every
+                                model call to stderr (pair with -E to scope the dump)
+          --no-confirm          trust batched YES answers without a per-line re-check
                                 (default: every line a batch vouches for is judged again
                                 alone, because long [Int] arrays are known to say yes
                                 loosely - this is what turns a cheap sieve into a true answer)

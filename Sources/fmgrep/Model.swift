@@ -285,12 +285,14 @@ func scoreEntries(
     instructions: String,
     mode: RunMode,
     notes: NotesBox?,
-    scope: String = ""
+    scope: String = "",
+    context: [(number: Int, text: String)] = []
 ) async throws -> RunResult {
     do {
         return try await scoreRun(
             lines: entries, fileDisplay: fileDisplay, totalLines: totalLines,
-            query: query, instructions: instructions, mode: mode, notes: notes, scope: scope
+            query: query, instructions: instructions, mode: mode, notes: notes, scope: scope,
+            context: context
         )
     } catch {
         // Any failure on a long run (guardrail refusal, context, truncated
@@ -330,6 +332,11 @@ license banners are never matches unless they state the query's technical \
 concept.
 """
 
+/// Set from `--dump-prompt`: writes the exact text handed to the model, for
+/// the lines that reach it, so judging behaviour can be argued about from the
+/// real input instead of from what the source appears to build.
+nonisolated(unsafe) var dumpPrompts = false
+
 /// Extra instruction tails per run mode.
 let notedRunGuidance = """
 You must also append one note: a structural fact about the file (what it is, \
@@ -349,7 +356,8 @@ func scoreRun(
     instructions: String,
     mode: RunMode,
     notes: NotesBox?,
-    scope: String = ""
+    scope: String = "",
+    context: [(number: Int, text: String)] = []
 ) async throws -> RunResult {
     let tail = (mode == .lean || notes == nil) ? "" : mode == .noted ? "\n" + notedRunGuidance : "\n" + annotatedRunGuidance
     let session = LanguageModelSession(instructions: Instructions(instructions + tail))
@@ -358,8 +366,20 @@ func scoreRun(
     // always corresponds to the line labeled k. Showing file-absolute numbers
     // here caused positional drift (answers landing on the wrong lines).
     var body = ""
-    for (i, entry) in lines.enumerated() {
-        body += "\(i + 1): \(String(entry.text.prefix(1000)))\n"
+    if lines.count == 1, !context.isEmpty {
+        // A lone line cannot show what it does: `error = EWOULDBLOCK;` is an
+        // answer only because the line above it says `case THREAD_TIMED_OUT:`.
+        // Surroundings are offered as read-only context, kept out of the
+        // numbered answer list so the decoding contract stays one integer.
+        body += "Line to judge:\n1: \(String(lines[0].text.prefix(1000)))\n\n"
+        body += "Its surroundings - context only, never answer for these:\n"
+        for c in context {
+            body += "\(c.number): \(String(c.text.prefix(400)))\n"
+        }
+    } else {
+        for (i, entry) in lines.enumerated() {
+            body += "\(i + 1): \(String(entry.text.prefix(1000)))\n"
+        }
     }
     let where_ = scope.isEmpty ? "" : " (\(scope))"
     let prompt = """
@@ -367,8 +387,20 @@ func scoreRun(
     File: \(fileDisplay) — \(lines.count) consecutive lines starting at line \(lines.first?.number ?? 1) of \(totalLines)\(where_)
 
     \(body)
-    Answer \(lines.count) times, in order: entry k judges the line numbered k. The line itself clearly answers the query = 2, adjacent topic only = 0, everything else = 1.
+    Answer \(lines.count) time\(lines.count == 1 ? "" : "s"), in order: entry k judges the line numbered k. 2 = that line IS where the query's thing happens or is decided, 1 = same mechanism but not where it happens, 0 = not about it.\(lines.count == 1 && !context.isEmpty ? " Use the surroundings to understand line 1; report on line 1 alone." : "")
     """
+    if dumpPrompts {
+        let dump = """
+        --- fmgrep: model call (mode=\(mode), lines=\(lines.count), temperature=0.0) ---
+        [INSTRUCTIONS]
+        \(instructions + tail)
+
+        [USER]
+        \(prompt)
+
+        """
+        FileHandle.standardError.write(dump.data(using: .utf8)!)
+    }
     let n = lines.count
     var properties: [GenerationSchema.Property] = [
         .init(name: "answers",
@@ -390,7 +422,7 @@ func scoreRun(
         }
     }
     let schema = GenerationSchema(type: LineAnswers.self, properties: properties)
-    let budget = n * 2 + (mode == .lean ? 48 : mode == .noted ? 144 : 224)
+    let budget = n * 2 + (mode == .lean ? 48 : mode == .noted ? 144 : 224) + context.count * 4
     let response = try await session.respond(to: prompt, schema: schema,
                                             options: GenerationOptions(temperature: 0.0, maximumResponseTokens: budget))
     let content = response.content
