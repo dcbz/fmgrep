@@ -45,6 +45,7 @@ struct Options {
     var cache = true               // identical line text judged once per scan
     var confirm = true             // batched YES answers get re-judged alone
     var recallSweep = true         // silent windows in a live file get re-swept smaller
+    var literalGate = true         // an exact value in the query gates candidate lines
     var rerank = false             // opt-in comparative gate; measured to cost more recall
                                    // than precision on real code, so it is not the default
     var dumpPrompt = false         // print the exact prompt for each model call
@@ -127,6 +128,7 @@ struct Options {
                 case "no-recall-sweep": o.recallSweep = false
                 case "rerank": o.rerank = true
                 case "no-rerank": o.rerank = false
+                case "no-literal": o.literalGate = false
                 case "no-verify": o.verify = false
                 case "scratchpad": o.scratchpad = true
                 case "no-scratchpad": o.scratchpad = false
@@ -241,7 +243,15 @@ func printUsage() {
                                 memory-allocation match). Trustworthy for prose,
                                 not for kernels.
           --blocks              coarse windows, ~80 lines each (legacy)
-              --rerank              one extra call per window: show the model its own
+              --no-literal          ignore an exact value in the query (see below)
+                                By default, when your query names something exact -
+                                100068, "ENXIO", 0xdeadbeef - the lines containing it
+                                are judged one by one, because a 3B model cannot do
+                                integer equality and will happily tell you that every
+                                line of /etc/rpc runs on port 100068. Everything else
+                                is still judged the normal way, so this only sharpens
+                                where it applies; it never skips a file.
+          --rerank              one extra call per window: show the model its own
                                 candidates together and ask which ones ARE answers.
                                 OFF by default because it was measured negative - on
                                 kern_synch it traded 91% recall for 33%->50% precision

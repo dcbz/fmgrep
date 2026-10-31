@@ -81,6 +81,15 @@ calls, and the architecture fights for every call:
   path and declarations, so `vm_kern.c` was skipped for `-E deallocate` - the
   file where `vm_object_deallocate` appears a few hundred times. It now tests the
   file, which costs a regex pass and no model calls.
+- **An exact value in your query is not a guess:** when the query names a
+  literal - `100068`, `"cmsd"`, `0xdeadbeef` - the lines containing it are judged
+  one at a time, because the 3B model cannot compare integers. Asked "what runs
+  on port 100068" it returned 66 of the 73 lines of `/etc/rpc`, one of them with
+  the reason "sunisamd on port 100068" while the line plainly says `100065`. It
+  is not reading the digits. The gate costs nothing in recall: it never skips a
+  file (lines without the literal are still swept the normal way), it is
+  announced with counts, and `--no-literal` turns it off. This is different in
+  kind from `--expand`, which filters on words the model invented.
 - **Never guess vocabulary for the user:** if you didn't pass `-E`, every
   candidate line still gets judged - a keyword list invented from the query
   is exactly what you were searching *because you didn't have*. (`--expand`

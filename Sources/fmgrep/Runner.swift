@@ -382,6 +382,23 @@ func neighborText(_ lines: [String], _ line: Int, _ delta: Int) -> String {
     return ""
 }
 
+/// An exact value the user typed: a number of three digits or more, a hex
+/// constant, or a quoted string. Not vocabulary the model invented - the
+/// literal is in the query, which is what makes it a fair thing to filter on.
+func queryLiterals(_ query: String) -> [String] {
+    var out: [String] = []
+    for pat in [#"0[xX][0-9a-fA-F]{2,}"#, #"\b\d{3,}\b"#, #""([^"]{2,})""#, #"'([^']{2,})'"#] {
+        guard let re = try? NSRegularExpression(pattern: pat) else { continue }
+        let ns = query as NSString
+        for m in re.matches(in: query, range: NSRange(location: 0, length: ns.length)) {
+            let g = m.numberOfRanges > 1 ? 1 : 0
+            let t = ns.substring(with: m.range(at: g))
+            if !out.contains(t) { out.append(t) }
+        }
+    }
+    return out
+}
+
 func regexHit(_ text: String, _ re: NSRegularExpression) -> Bool {
     let ns = text as NSString
     return re.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) != nil
@@ -851,8 +868,27 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
             expanded = []
         }
     }
+    // A query that names an exact value is a lookup, and a lookup has a
+    // deterministic answer set: the lines that contain it. The 3B judge cannot
+    // compare integers at all - asked "what runs on port 100068" it returned 66
+    // of 73 lines from /etc/rpc, each with a confident reason. So the lines that
+    // DO contain the literal get the precise path (one call each, with context)
+    // instead of the cheap sieve.
+    //
+    // Note what this is not: it is not --expand. Nothing model-guessed is being
+    // filtered on, and nothing is skipped - files with no literal still get
+    // swept exactly as they would have.
+    var literals: [String] = []
+    if options.engine != .blocks, options.prefilter == nil, options.literalGate, pattern == nil {
+        literals = queryLiterals(options.query)
+        if !literals.isEmpty {
+            pattern = literals.map { "\\b" + NSRegularExpression.escapedPattern(for: $0) + "\\b" }
+                .joined(separator: "|")
+        }
+    }
     var plan: [Int: FilePlan] = [:]
-    var lineCalls = 0, runCalls = 0, zeroSkipFiles = 0
+    var lineCalls = 0, runCalls = 0, zeroSkipFiles = 0, literalFreeFiles = 0
+    let expandedUsed = pattern != nil && literals.isEmpty   // model-guessed filter in play
     if options.engine != .blocks {
         let planRe = pattern.flatMap { try? NSRegularExpression(pattern: $0, options: [.caseInsensitive]) }
         for spec in files {
@@ -866,9 +902,12 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
                     if !line.trimmingCharacters(in: .whitespaces).isEmpty, regexHit(line, planRe) { acc += 1 }
                 }
                 if m == 0 {
-                    if f.lines.count <= options.sweepMaxLines {
+                    if f.lines.count <= options.sweepMaxLines || !expandedUsed {
+                        // A literal gate never hides a file: it sharpens the
+                        // lines it matches and sweeps the rest as usual.
                         plan[spec.id] = .runs
                         runCalls += runs
+                        if !literals.isEmpty { literalFreeFiles += 1 }
                     } else {
                         plan[spec.id] = .skip
                         zeroSkipFiles += 1
@@ -886,6 +925,9 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
             }
         }
         let calls = lineCalls + runCalls
+        if !literals.isEmpty {
+            FileHandle.standardError.write("fmgrep: query names an exact value (\(literals.prefix(4).joined(separator: ", "))) - \(lineCalls) line(s) contain it and are judged one by one; \(literalFreeFiles) file(s) without it are swept as usual (--no-literal for pure semantic judging)\n".data(using: .utf8)!)
+        }
         if !expanded.isEmpty {
             FileHandle.standardError.write("fmgrep: prefilter keywords from the model: \(expanded.prefix(10).joined(separator: " | ")) ... (--no-expand for an exhaustive scan, -E to override)\n".data(using: .utf8)!)
         }
