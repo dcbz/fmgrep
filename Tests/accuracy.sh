@@ -16,6 +16,13 @@ if [ ! -r "$XNU/osfmk/vm/vm_kern.c" ]; then
 	exit 0
 fi
 
+# ENG holds extra flags for the run being scored, so engines can be compared
+# with the same scorer and the same ground truth:
+#   ENG="--blocks --block-lines 48" ./Tests/accuracy.sh
+# Word-split on purpose; keep it free of shell metacharacters.
+ENG=${ENG:-}
+LABEL=${LABEL:-"engine: default funnel (32-line sieve + per-line confirm)"}
+
 score() { # name  truth_file  got_file
 	awk -v t="$2" -v g="$3" -v n="$1" '
 		function load(f, into,   line) { while ((getline line < f) > 0) into[line]=1; close(f) }
@@ -31,23 +38,36 @@ score() { # name  truth_file  got_file
 		}'
 }
 
+# A run that died prints nothing and scores a perfect-looking 0 hits; refuse to
+# report those. Case 1 must always produce at least one line.
+require_hits() { # got_file  label
+	if [ ! -s "$1" ]; then
+		printf '%-22s RUN PRODUCED NO OUTPUT (%s) - see stderr, not a measurement\n' "$2" "$3"
+		return 1
+	fi
+	return 0
+}
+
 # --- case 1: one file, verb-to-identifier gap, every site hand-grepped ---
 printf '935\n1162\n1163\n1516\n1795\n2289\n4523\n4562\n4590\n4618\n5054\n' > "$TMP/truth1"
-$BIN --no-color -E 'deallocate' \
+$BIN --no-color $ENG -E 'deallocate' \
 	"where are kernel memory objects handed back to the system" \
 	"$XNU/osfmk/vm/vm_kern.c" 2>"$TMP/err1" \
 	| sed -n 's/.*vm_kern\.c:\([0-9]*\):.*/\1/p' | sort -n > "$TMP/got1"
-score "vm_kern dealloc" "$TMP/truth1" "$TMP/got1"
+require_hits "$TMP/got1" "vm_kern dealloc" "case 1" \
+	&& score "vm_kern dealloc" "$TMP/truth1" "$TMP/got1"
 
 # --- case 2: topically saturated code (_sleep's own file), strict truth set.
 # Lines where the wait is abandoned or its outcome is decided. Neighbours such
 # as `if (catch)` are deliberately outside the set: they gate the answer.
 head -128 "$XNU/bsd/kern/kern_synch.c" > "$TMP/synch128.c"
 printf '79\n80\n92\n94\n95\n99\n101\n104\n105\n109\n112\n' > "$TMP/truth2"
-$BIN --no-color "places where the code gives up waiting because the resource it needs is no longer available" \
+$BIN --no-color $ENG "places where the code gives up waiting because the resource it needs is no longer available" \
 	"$TMP/synch128.c" 2>"$TMP/err2" \
 	| sed -n 's/.*synch128\.c:\([0-9]*\):.*/\1/p' | sort -n > "$TMP/got2"
-score "kern_synch abort paths" "$TMP/truth2" "$TMP/got2"
+require_hits "$TMP/got2" "kern_synch abort paths" "case 2" \
+	&& score "kern_synch abort paths" "$TMP/truth2" "$TMP/got2"
+echo "-> $LABEL  [flags: ${ENG:-none}]"
 
 # --- the levers, restated, because their cost is the interesting part ---
 echo "funnel chatter (case 2):"

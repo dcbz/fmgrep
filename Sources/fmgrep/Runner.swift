@@ -273,6 +273,14 @@ actor CollapseGuard {
     private(set) var dropped = 0
     func rerank(kept: Int, dropped: Int) { self.kept += kept; self.dropped += dropped }
 
+    private var triaged: [String] = []
+    func triageDrop(_ file: String) { triaged.append(file) }
+    var triagedFiles: [String] { triaged }
+
+    private var prefiltered = 0
+    func prefilterDrop(_ file: String) { prefiltered += 1 }
+    var prefilteredFiles: Int { prefiltered }
+
     /// Files whose answer set is a large fraction of the file. That is not a
     /// search result, it is the file: the model has judged the whole thing to be
     /// about the query, which on code that is genuinely about one subject
@@ -424,9 +432,20 @@ func processFile(
         // In hybrid mode, -E first filters the whole file for free: a file
         // whose path and declarations miss the regex is unlikely to hold the
         // answer; set --no-triage for exhaustive -E semantics.
-        if let regex, regex.firstMatch(in: spec.display + "\n" + Symbols.outline(file.symbols, maxChars: 2000),
-                                        range: NSRange(location: 0, length: (spec.display + "\n" + Symbols.outline(file.symbols, maxChars: 2000)).utf16.count)) == nil {
-            return
+        // In hybrid mode, -E can filter a whole file for free - but it has to
+        // test the file, not just its name and declarations. Checking only the
+        // outline silently dropped vm_kern.c for `-E deallocate`, a file whose
+        // body says vm_object_deallocate a few hundred times.
+        if let regex {
+            let hay = spec.display + "\n" + Symbols.outline(file.symbols, maxChars: 2000)
+            var hit = regex.firstMatch(in: hay, range: NSRange(location: 0, length: (hay as NSString).length)) != nil
+            if !hit {
+                hit = file.lines.contains { regexHit($0, regex) }   // free: no model, no allocation
+            }
+            if !hit {
+                await guard_.prefilterDrop(spec.display)
+                return
+            }
         }
         await semaphore.wait()
         do {
@@ -436,7 +455,16 @@ func processFile(
                 query: options.query
             )
             await semaphore.signal()
-            if !rel.relevant && rel.confidence >= 1 { return }
+            // Dropping a file is unrecoverable output, so it requires the model
+            // to be certain - and even then it is announced. A file's words and
+            // the query's words are allowed not to overlap (that is the entire
+            // premise), which is exactly how "this file is irrelevant" goes
+            // wrong: vm_kern.c was being dropped for a query about kernel memory
+            // allocation, silently, once the symbol fix switched triage on.
+            if !rel.relevant, rel.confidence >= 2 {
+                await guard_.triageDrop(spec.display)
+                return
+            }
             if options.scratchpad == nil, rel.needsNotes, file.lines.count > 150 {
                 notes = NotesBox()   // auto: the model asked for memory, on this file only
             }
@@ -903,6 +931,15 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
     if settled.engine != .blocks {
         let g = await guard_.report()
         let gk = await guard_.report()
+        let skipped = await guard_.prefilteredFiles
+        if skipped > 0 {
+            FileHandle.standardError.write("fmgrep: -E matched neither the path, declarations nor any line of \(skipped) file(s); they were not scanned\n".data(using: .utf8)!)
+        }
+        let hidden = await guard_.triagedFiles
+        if !hidden.isEmpty {
+            let sample = hidden.prefix(3).joined(separator: ", ")
+            FileHandle.standardError.write("fmgrep: triage judged \(hidden.count) file(s) irrelevant and did not scan them (\(sample)\(hidden.count > 3 ? ", ..." : "")) - this is where a semantic-only answer would hide; --no-triage scans everything\n".data(using: .utf8)!)
+        }
         if gk.dropped > 0 {
             FileHandle.standardError.write("fmgrep: comparative pass: kept \(gk.kept), dropped \(gk.dropped) candidates that were only next to the topic (--no-rerank to print them all)\n".data(using: .utf8)!)
         }

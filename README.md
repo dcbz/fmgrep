@@ -73,6 +73,14 @@ wall time *aggregate* — calls pipeline somewhat but the model serializes, so
 `-j` buys much less than it looks like it should. Cost therefore = number of
 calls, and the architecture fights for every call:
 
+- **Nothing is dropped quietly.** A file the `-E` prefilter cannot find is
+  counted on stderr, a file triage rejects with certainty is named on stderr
+  with the escape hatch, and a run that produced no output at all cannot be
+  scored as if it scored well (`Tests/accuracy.sh` refuses to). These gates were
+  each found by a ground-truth case returning zero: `-E` was testing only the
+  path and declarations, so `vm_kern.c` was skipped for `-E deallocate` - the
+  file where `vm_object_deallocate` appears a few hundred times. It now tests the
+  file, which costs a regex pass and no model calls.
 - **Never guess vocabulary for the user:** if you didn't pass `-E`, every
   candidate line still gets judged - a keyword list invented from the query
   is exactly what you were searching *because you didn't have*. (`--expand`
@@ -108,9 +116,23 @@ and prints recall/false-positives/precision, so a change that quietly trades
 recall for a prettier number gets caught:
 
 ```console
+$ ./Tests/accuracy.sh                       # default funnel
 vm_kern dealloc        hits=11   recall=11/11  false-positives=0  precision=100%
-kern_synch abort paths hits=19   recall=8/11   false-positives=11 precision=42%
+kern_synch abort paths hits=25   recall=9/11   false-positives=16 precision=36%
+
+$ ENG="--blocks --block-lines 48" ./Tests/accuracy.sh
+vm_kern dealloc        hits=6    recall=3/11   false-positives=3  precision=50%
+kern_synch abort paths hits=1    recall=1/11   false-positives=0  precision=100%
 ```
+
+Same corpus, same ground truth, so the engines can be compared rather than
+described: window-level judging is precise and misses almost everything, which is
+why the line engines are the default and `--blocks` is legacy. It also names the
+line numbers it does choose slightly differently (the guard above a call rather
+than the call), so treat `--blocks` output as discovery, not as something to jump
+to. Recall on case 2 moves between 9 and 11 out of 11 run to run; the missed
+lines are printed because with this model they are score-1 wobbles, not lost
+candidates.
 
 Case 1 is a verb-to-identifier gap (`grep deallocate` cannot express the query,
 `-E deallocate` here is only a scoping aid). Case 2 is the hard one: `_sleep()`'s
