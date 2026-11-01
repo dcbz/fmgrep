@@ -47,6 +47,7 @@ struct Options {
     var recallSweep = true         // silent windows in a live file get re-swept smaller
     var literalGate = true         // an exact value in the query gates candidate lines
     var numericGate = true         // a comparison in the query is evaluated in Swift
+    var predicate = true           // the model writes the condition, python3 runs it
     var rerank = false             // opt-in comparative gate; measured to cost more recall
                                    // than precision on real code, so it is not the default
     var dumpPrompt = false         // print the exact prompt for each model call
@@ -131,6 +132,8 @@ struct Options {
                 case "no-rerank": o.rerank = false
                 case "no-literal": o.literalGate = false
                 case "no-numeric": o.numericGate = false
+                case "predicate": o.predicate = true
+                case "no-predicate": o.predicate = false
                 case "no-verify": o.verify = false
                 case "scratchpad": o.scratchpad = true
                 case "no-scratchpad": o.scratchpad = false
@@ -245,7 +248,30 @@ func printUsage() {
                                 memory-allocation match). Trustworthy for prose,
                                 not for kernels.
           --blocks              coarse windows, ~80 lines each (legacy)
-              --no-literal          ignore an exact value in the query (see below)
+          --predicate / --no-predicate
+                                Ask the model to COMPILE the query into one Python
+                                condition, then evaluate that condition over every
+                                line in a sandboxed python3. The model can neither do
+                                arithmetic nor verify that a string is present in a
+                                line - it recognises the shape of such a question and
+                                answers confidently - so it writes the test and never
+                                judges it. The expression and a plain English reading
+                                are printed on every run; anything it refuses to run
+                                (imports, attribute access, a name outside
+                                num/nums/txt/line/words) is reported, and the search
+                                falls back to ordinary judging. Its `role` decides
+                                how it is used: 'sole' means the condition IS the
+                                question (a value or range lookup) and no line is
+                                judged at all; 'part' means it only narrows what the
+                                model reads. Cost: one call plus seconds of python.
+          --no-numeric          ask the model to evaluate a comparison in the query
+                                ("above 100000", "under 60", "between 100 and 200")
+                                instead of computing it - the fallback for when
+                                --predicate is off. Measured: on five lines with
+                                three qualifying rows it returned none. A line whose
+                                number satisfies the stated comparison is never
+                                suppressed by the model's opinion of arithmetic.
+          --no-literal          ignore an exact value in the query (see below)
                                 By default, when your query names something exact -
                                 100068, "ENXIO", 0xdeadbeef - the lines containing it
                                 are judged one by one, because a 3B model cannot do

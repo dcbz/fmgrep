@@ -69,6 +69,21 @@ require_hits "$TMP/got2" "kern_synch abort paths" "case 2" \
 	&& score "kern_synch abort paths" "$TMP/truth2" "$TMP/got2"
 echo "-> $LABEL  [flags: ${ENG:-none}]"
 
+# --- case 3: the computed path. No model call should be spent here at all: ---
+# --- the answer is arithmetic, and the tool must say so rather than guess.  ---
+if [ -r /etc/rpc ]; then
+	printf '41\n' > "$TMP/truth3"
+	$BIN --no-color $ENG 'what runs on port 100068' /etc/rpc 2>"$TMP/err3" \
+		| sed -n 's/.*\/rpc:\([0-9]*\):.*/\1/p' | sort -n > "$TMP/got3"
+	require_hits "$TMP/got3" "rpc port lookup" "case 3" \
+		&& score "rpc port lookup" "$TMP/truth3" "$TMP/got3"
+	if grep -q "no line goes to the model" "$TMP/err3"; then
+		echo "                       computed without a judging call: yes"
+	else
+		echo "                       computed without a judging call: NO - it judged lines instead"
+	fi
+fi
+
 # --- the levers, restated, because their cost is the interesting part ---
 echo "funnel chatter (case 2):"
 sed -n 's/^fmgrep: /  /p' "$TMP/err2" | grep -E "cache|guard|note:" || true

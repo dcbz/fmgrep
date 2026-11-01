@@ -81,6 +81,39 @@ calls, and the architecture fights for every call:
   path and declarations, so `vm_kern.c` was skipped for `-E deallocate` - the
   file where `vm_object_deallocate` appears a few hundred times. It now tests the
   file, which costs a regex pass and no model calls.
+- **The query becomes a program, but never one the model writes.** Ask
+  `fmgrep "what runs on port 100068" /etc/rpc` and you get:
+
+  ```console
+  fmgrep: condition: any(v == 100068.0 for v in nums)
+         meaning: A line must have exactly one number equal to 100068 to match.
+         1 line(s) satisfy it - that IS the whole question, so no line goes to
+         the model (--no-predicate to disable)
+  /etc/rpc:41:cmsd          100068
+  ```
+
+  One model call turns the request into structured checks - field, comparison,
+  value - and Swift renders those into a single Python expression that
+  `python3 -I -S -E` evaluates over every line. Zero judging calls for a value
+  lookup, and the scale that implies: `the line for "umbrella"` over
+  `/usr/share/dict/words` - 235,976 lines - is answered in 2.5 s, model calls
+  spent: one, to write the condition, none to judge anything. Three rules keep it honest:
+  - **the model writes no code.** It chooses from `num/nums/txt/words/line` and
+    `gt/ge/lt/le/eq/ne/between/contains/startswith/word/match`; the expression is
+    assembled from a table, and the sandbox still ast-walks it (allowlisted names,
+    attributes and calls, emptied `__builtins__`) because a bug in the renderer
+    should not be the last line of defence.
+  - **every value must be a piece of your own query.** A number or word the model
+    invented is a guess, and a guess used as a filter hides the answers phrased
+    differently - the thing this tool exists to avoid. Such a condition is
+    rejected out loud and the search judges by meaning instead.
+  - **`sole` needs arithmetic.** Answering from the condition alone is allowed when
+    the tests compare numbers, or when the value was quoted in the query
+    (`the entry for "cmsd"`). A merely textual condition only ever *narrows* which
+    lines get read - the full sweep still runs, so a wrong guess costs a little
+    time and never an answer. Measured: `where is the portmapper table explained`
+    compiled to `('portmapper' in txt.lower())`, matched nothing, and the sweep
+    still returned the right lines.
 - **What the model cannot do, so the tool stops asking.** Two measured
   failures define the deterministic part of the funnel:
   - *comparison*: five lines of `name<TAB>port`, two above `100000`, asked "which

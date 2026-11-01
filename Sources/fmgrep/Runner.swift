@@ -102,6 +102,59 @@ actor Sink {
 
     /// Report one block verdict. Returns false when the file should stop
     /// evaluating its remaining blocks.
+    /// A search whose condition was computed rather than judged has an answer set
+    /// already; printing it goes through the same modes (-l/-c/-q/-m) without a
+    /// verdict round trip, because there is nothing left for a model to opine on.
+    func emitComputed(fileID: Int, display: String, pairs: [(line: Int, text: String)]) -> Bool {
+        hadMatch.insert(fileID)
+        if options.quiet {
+            stopAll = true
+            registry.cancelAll()
+            return false
+        }
+        if options.listFiles {
+            guard announced.insert(fileID).inserted else { return true }
+            printer.plain(display)
+            if options.maxCount > 0, announced.count >= options.maxCount {
+                stopAll = true
+                registry.cancelAll()
+            }
+            return !stopAll
+        }
+        if options.count {
+            counts[fileID, default: 0] += pairs.count
+            return true
+        }
+        for p in pairs {
+            if printedKeys.insert("\(fileID):\(p.line)").inserted { counts[fileID, default: 0] += 1 }
+            if options.json {
+                emitJSON(file: display, line: p.line, text: p.text, quote: "",
+                         reason: "satisfies the condition \(computedWhy)")
+                continue
+            }
+            if options.top > 0 {
+                ranked.append(ScoredMatch(display: display, line: p.line, text: p.text, quote: "",
+                                          reason: "satisfies the condition \(computedWhy)", score: 200))
+                continue
+            }
+            printer.matchLine(file: display, number: options.lineNumbers ? p.line : nil,
+                              text: p.text, quote: "",
+                              explain: options.debug ? "satisfies \(computedWhy)" : nil)
+            emittedLines += 1
+            if options.maxCount > 0, emittedLines >= options.maxCount {
+                stopAll = true
+                registry.cancelAll()
+                return false
+            }
+        }
+        return true
+    }
+
+    /// The expression that decided an emitted-by-computation line, set once per
+    /// scan so --json and --debug can attribute it.
+    var computedWhy = ""
+    func setComputedWhy(_ expr: String) { computedWhy = expr }
+
     func hitCount(_ fileID: Int) -> Int { counts[fileID] ?? 0 }
 
     func report(_ verdict: MatchVerdict, block: Block, display: String, scores: [Int: Int] = [:]) -> Bool {
@@ -403,12 +456,17 @@ func queryLiterals(_ query: String) -> [String] {
     return out
 }
 
+/// Scan-level status lines, before any sink exists.
+func say(_ message: String) {
+    FileHandle.standardError.write("fmgrep: \(message)\n".data(using: .utf8)!)
+}
+
 func regexHit(_ text: String, _ re: NSRegularExpression) -> Bool {
     let ns = text as NSString
     return re.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) != nil
 }
 
-enum FilePlan: Sendable, Equatable { case skip, lines, runs, blocks }
+enum FilePlan: Sendable, Equatable { case skip, lines, runs, predlines, blocks }
 
 func processFile(
     _ spec: FileSpec,
@@ -417,6 +475,8 @@ func processFile(
     plan: FilePlan?,
     pattern: String?,
     numeric: NumericRule?,
+    pred: PredicateIndex?,
+    predAuthoritative: Bool,
     cache: VerdictCache,
     guard_: CollapseGuard,
     semaphore: Semaphore,
@@ -508,13 +568,30 @@ func processFile(
     // Line-granular engines: score runs of lines (default, 32/call) or strict
     // one-line-per-call. Each answer is a binary per-line decision - the
     // per-line prompt shape, at 1/32 the calls.
+    let predLines: Set<Int> = pred == nil ? [] : await pred!.lines(spec.id)
+
     if options.engine != .blocks || plan != nil {
         var lineInstructions = options.instructionsOverride ?? defaultRunInstructions
         if !matchTest.isEmpty {
             lineInstructions += "\nQuery annotation (example vocabulary and exclusions ONLY - a line answering the query without these words still passes):\n" + matchTest
         }
         let chunks: [[(number: Int, text: String)]]
-        if plan == .lines, numeric != nil, regex == nil {
+        if plan == .predlines {
+            var cs: [[(number: Int, text: String)]] = file.lines.enumerated()
+                .filter { predLines.contains($0.offset + 1) && !$0.element.trimmingCharacters(in: .whitespaces).isEmpty }
+                .map { [($0.offset + 1, $0.element)] }
+            var q = 0
+            while q < file.lines.count {
+                let e = min(q + options.scoreLines, file.lines.count)
+                cs.append(Array(q ..< e).map { (number: $0 + 1, text: file.lines[$0]) })
+                q = e
+            }
+            chunks = cs
+        } else if plan == .lines, !predLines.isEmpty {
+            chunks = file.lines.enumerated()
+                .filter { predLines.contains($0.offset + 1) && !$0.element.trimmingCharacters(in: .whitespaces).isEmpty }
+                .map { [($0.offset + 1, $0.element)] }
+        } else if plan == .lines, numeric != nil, regex == nil {
             chunks = file.lines.enumerated()
                 .filter { !$0.element.trimmingCharacters(in: .whitespaces).isEmpty && numeric!.matches($0.element) }
                 .map { [($0.offset + 1, $0.element)] }
@@ -535,6 +612,17 @@ func processFile(
                 let step = options.debug ? 1 : options.matchedChunk
                 cs.append(hits[i ..< min(i + step, hits.count)].map { ($0.offset + 1, $0.element) })
                 i += step
+            }
+            chunks = cs
+        } else if plan == .runs, !predLines.isEmpty, regex == nil {
+            let hits = file.lines.enumerated().filter {
+                predLines.contains($0.offset + 1) && !$0.element.trimmingCharacters(in: .whitespaces).isEmpty
+            }
+            var cs: [[(number: Int, text: String)]] = []
+            var i = 0
+            while i < hits.count {
+                cs.append(hits[i ..< min(i + options.matchedChunk, hits.count)].map { ($0.offset + 1, $0.element) })
+                i += options.matchedChunk
             }
             chunks = cs
         } else {
@@ -698,7 +786,10 @@ func processFile(
                 guard text.rangeOfCharacter(from: .alphanumerics) != nil else { return nil }
                 reason = v.reason
                 let score: Int
-                if let numeric, numeric.matches(text) {
+                if predAuthoritative, predLines.contains(entries[v.pos].number), v.score < threshold {
+                    score = threshold
+                    if options.debug { pendingFloor.append((entries[v.pos].number, v.score)) }
+                } else if let numeric, numeric.matches(text) {
                     score = max(v.score, threshold)      // arithmetic, not opinion
                     if options.debug, v.score < threshold {
                         pendingFloor.append((entries[v.pos].number, v.score))
@@ -769,9 +860,13 @@ func processFile(
             if await sink.isDoneForFile(spec.id) { break }
             if entries.allSatisfy({ $0.text.trimmingCharacters(in: .whitespaces).isEmpty }) { continue }
             if let regex, plan != .lines, !entries.contains(where: { regexHit($0.text, regex) }) { continue }
+            if !predLines.isEmpty, plan != .predlines,
+               !entries.contains(where: { predLines.contains($0.number) }) { continue }
 
             let judged = await resolve(entries, at: 0)
-            if options.recallSweep, entries.count > options.matchedChunk {
+            // A file with a condition has already had its qualifying lines judged
+            // one by one, which is what the finer re-sweep exists to recover.
+            if options.recallSweep, plan != .predlines, entries.count > options.matchedChunk {
                 silent.append(entries)
             }
             if !(await reportWindow(judged, entries)) { break }
@@ -903,6 +998,62 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
     // Note what this is not: it is not --expand. Nothing model-guessed is being
     // filtered on, and nothing is skipped - files with no literal still get
     // swept exactly as they would have.
+    // The model writes the condition, python3 evaluates it. It is asked for the
+    // one part of this it is good at - translation - and never asked to evaluate
+    // its own answer, because measured on this corpus it cannot compare two
+    // integers, and cannot notice whether a word is present in a line.
+    var predExpr: String?
+    var predRole = "part"
+    var predNumeric = false
+    let predIndex = PredicateIndex()
+    // Always asked, not only when the query contains a number: one call is
+    // nothing against the thousands a scan spends, and its `meaning` sentence is
+    // the user's receipt that the tool read the request the way they did.
+    if options.predicate, options.engine != .blocks, options.prefilter == nil,
+       let p = await compilePredicate(query: options.query) {
+        let expr = p.tests.isEmpty ? nil
+            : PredicateEngine.render(p.tests, combine: p.combine, derivedFrom: options.query)
+        if !p.tests.isEmpty, expr == nil, p.tests.contains(where: {
+            !options.query.lowercased().contains($0.value.lowercased().trimmingCharacters(in: .whitespaces)) }) {
+            say("condition rejected: it tests \(p.tests.map { $0.value }.filter { !$0.isEmpty }.prefix(3).joined(separator: ", ")) which is not in your query - guessing vocabulary would hide answers phrased differently, so judging by meaning instead")
+        }
+        if p.tests.isEmpty {
+            say("no per-line condition in this query (\(p.meaning)) - judging by meaning")
+        } else if expr == nil {
+            say("could not build a condition from \(p.tests.count) check(s) - judging by meaning")
+        } else if let expr {
+            let paths = files.compactMap { spec -> (Int, String)? in
+                guard let u = spec.url, u.isFileURL else { return nil }
+                return (spec.id, u.path)
+            }
+            if paths.isEmpty {
+                say("predicate not applied: no files on disk to evaluate over (stdin scan)")
+            } else if let why = await PredicateEngine.evaluate(expr: expr, files: paths,
+                                                              into: predIndex, timeout: 120) {
+                say("predicate not used (\(expr)) - \(why); judging normally instead")
+            } else {
+                // `sole` - print the satisfying lines and judge nothing - is only
+                // honoured when the condition cannot be a guess about vocabulary:
+                // every test compares numbers, or the value is something the user
+                // typed verbatim into the query in quotes. A model-invented
+                // `'memory' in txt` is a keyword filter wearing a compiler, and
+                // keyword filters are what this tool exists to avoid.
+                let arithmetic = p.tests.allSatisfy { ["num", "nums", "line"].contains($0.field.lowercased()) }
+                let quoted = p.tests.allSatisfy {
+                    options.query.contains("\"\($0.value)\"") || options.query.contains("'\($0.value)'")
+                }
+                predExpr = expr
+                predNumeric = arithmetic
+                predRole = (p.role == "sole" && (arithmetic || quoted)) ? "sole" : "part"
+                let n = await predIndex.total
+                let how = predRole == "sole"
+                    ? "that IS the whole question, so no line goes to the model"
+                    : "it only narrows which lines the model reads"
+                say("condition: \(expr)\n       meaning: \(p.meaning)\n       \(n) line(s) satisfy it - \(how) (--no-predicate to disable)")
+            }
+        }
+    }
+
     var literals: [String] = []
     var numeric: NumericRule?
     if options.engine != .blocks, options.numericGate {
@@ -910,7 +1061,8 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
         // independent of which lines are being offered to the model.
         numeric = NumericRule.detect(options.query)
     }
-    if options.engine != .blocks, options.prefilter == nil, options.literalGate, pattern == nil, numeric == nil {
+    if options.engine != .blocks, options.prefilter == nil, options.literalGate, pattern == nil,
+       numeric == nil, predExpr == nil {
         literals = queryLiterals(options.query)
         if !literals.isEmpty {
             pattern = literals.map { "\\b" + NSRegularExpression.escapedPattern(for: $0) + "\\b" }
@@ -954,6 +1106,16 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
                     plan[spec.id] = .runs
                     runCalls += (m + options.matchedChunk - 1) / options.matchedChunk
                 }
+            } else if predExpr != nil {
+                // Qualifying lines are judged one by one, and the rest of the file
+                // is still swept at 32 lines/call. A condition the model wrote is
+                // a reason to look closely at some lines, not a licence to skip
+                // others: an answer phrased without the queried words is exactly
+                // what would be lost.
+                let m = await predIndex.count(spec.id)
+                plan[spec.id] = .predlines
+                lineCalls += m
+                runCalls += runs
             } else if let planTest {
                 // Numeric condition: qualifying lines get judged one by one, and
                 // the condition itself is enforced in reportWindow, not here.
@@ -1010,11 +1172,32 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
     let semaphore = Semaphore(settled.jobs)
     let registry = TaskRegistry()
     let sink = Sink(options: settled, registry: registry)
+    if let expr = predExpr { await sink.setComputedWhy(expr) }
+
+    if predRole == "sole", predExpr != nil {
+        var emitted = false
+        for spec in files {
+            guard !Task.isCancelled else { break }
+            guard let f = try? loadFile(spec, maxBytes: options.maxFileBytes) else { continue }
+            let hits = (await predIndex.lines(spec.id)).sorted().compactMap { n -> (line: Int, text: String)? in
+                guard n >= 1, n <= f.lines.count else { return nil }
+                return (n, f.lines[n - 1])
+            }
+            if hits.isEmpty { continue }
+            emitted = true
+            if !(await sink.emitComputed(fileID: spec.id, display: spec.display, pairs: hits)) { break }
+        }
+        // finish() answers "did the summary phase print", which is not the exit
+        // status question; the status is whether the computed answer was empty.
+        await sink.finish(files: files)
+        return emitted ? 0 : 1
+    }
 
     var tasks: [Task<Void, Never>] = []
     for spec in files {
         let task = Task(priority: .userInitiated) {
-            await processFile(spec, options: settled, matchTest: matchTest, plan: planDict[spec.id], pattern: patternStr, numeric: numeric, cache: cache, guard_: guard_, semaphore: semaphore, sink: sink)
+            await processFile(spec, options: settled, matchTest: matchTest, plan: planDict[spec.id], pattern: patternStr, numeric: numeric, pred: predExpr == nil ? nil : predIndex,
+                       predAuthoritative: predNumeric, cache: cache, guard_: guard_, semaphore: semaphore, sink: sink)
         }
         registry.register(task)
         tasks.append(task)

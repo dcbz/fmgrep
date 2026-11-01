@@ -351,6 +351,55 @@ if nothing new.
 let annotatedRunGuidance = notedRunGuidance + " Keep reason to one short clause supporting the matches."
 
 @Generable
+struct PredicateTest {
+    @Guide(description: "what to look at on the line: 'num' the first number on it, 'nums' all numbers on it, 'txt' the line as text, 'words' its whitespace-separated fields, 'line' the line number itself")
+    var field: String
+    @Guide(description: "the comparison: 'gt' 'ge' 'lt' 'le' 'eq' 'ne' for numbers, 'between' for a range, 'contains' for text anywhere on the line, 'startswith' for text at its beginning, 'word' for an exact field in words, 'match' for a regular expression, 'none' when the line must have no number at all")
+    var op: String
+    @Guide(description: "the value to compare against, as written in the request: a number for the numeric comparisons, the text for the others. Empty for op 'none'.")
+    var value: String
+    @Guide(description: "upper bound, only for op 'between'; empty otherwise")
+    var value2: String
+    @Guide(description: "for field 'nums': true only if EVERY number on the line must satisfy the comparison; false if any one of them may")
+    var every: Bool
+}
+
+@Generable
+struct LinePredicate {
+    @Guide(description: "the conditions a line must satisfy. One per distinct part of the request that can be checked on a single line; leave empty when nothing is computable and the question is pure meaning")
+    var tests: [PredicateTest]
+    @Guide(description: "'and' if a line must satisfy every condition, 'or' if any one is enough")
+    var combine: String
+    @Guide(description: "one sentence in plain English saying exactly which lines pass, so a human can check the tool's reading of the request")
+    var meaning: String
+    @Guide(description: "'sole' when these conditions ARE the whole question (what has value X, what is above X, which lines mention Y); 'part' when the request also asks something only a reader can judge, so the conditions only narrow which lines get read")
+    var role: String
+}
+
+let predicateInstructions = """
+You turn a search request into the checks a machine can run on ONE line of a \
+file. You never run them and never answer the request: another program applies \
+what you write to every line in turn, so describe only what must be true of a \
+single line. Use numbers exactly as the request states them. If the request \
+cannot be reduced to per-line checks (it asks about purpose, intent, or \
+behaviour spread across a file), return an empty list of tests.
+"""
+
+func compilePredicate(query: String) async -> LinePredicate? {
+    let session = LanguageModelSession(instructions: Instructions(predicateInstructions))
+    do {
+        let response = try await session.respond(
+            to: "Search request: \(query)\nWhich per-line checks define a matching line?",
+            generating: LinePredicate.self,
+            options: GenerationOptions(temperature: 0.0, maximumResponseTokens: 320)
+        )
+        return response.content
+    } catch {
+        return nil
+    }
+}
+
+@Generable
 struct Selection {
     @Guide(description: "the numbers of the listed lines that really answer the query, taken from the numbers shown at the start of each line; leave empty if none of them do")
     var keep: [Int]
