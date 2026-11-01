@@ -81,6 +81,23 @@ calls, and the architecture fights for every call:
   path and declarations, so `vm_kern.c` was skipped for `-E deallocate` - the
   file where `vm_object_deallocate` appears a few hundred times. It now tests the
   file, which costs a regex pass and no model calls.
+- **What the model cannot do, so the tool stops asking.** Two measured
+  failures define the deterministic part of the funnel:
+  - *comparison*: five lines of `name<TAB>port`, two above `100000`, asked "which
+    service runs on a port above 100000" it returned **none**. Same for a
+    `potato` rule: it will say the required thing for every input, because it is
+    matching the shape of a test, not evaluating it.
+  - *containment*: asked for "the line for alpha" it flagged a line with no
+    `alpha` in it and explained that "the line directly states 'alpha'".
+    Presence claims are confabulated, so fmgrep checks them itself.
+
+  So a comparison written into the query (`above 100000`, `under 60`, `between 100
+  and 200`) is evaluated in Swift: a line holding a standalone number that
+  satisfies it is an answer regardless of what the model says about it
+  (`--no-numeric` to hand it to the model anyway). Only literals that *are*
+  values count - `kmem_100068` is an identifier, `10ms` is a duration,
+  `(16ULL << 10)` is an expression, and none of them get floored. The semantic
+  part of the query is still the model's job; the arithmetic is not.
 - **An exact value in your query is not a guess:** when the query names a
   literal - `100068`, `"cmsd"`, `0xdeadbeef` - the lines containing it are judged
   one at a time, because the 3B model cannot compare integers. Asked "what runs

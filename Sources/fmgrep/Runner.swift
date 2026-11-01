@@ -416,6 +416,7 @@ func processFile(
     matchTest: String,
     plan: FilePlan?,
     pattern: String?,
+    numeric: NumericRule?,
     cache: VerdictCache,
     guard_: CollapseGuard,
     semaphore: Semaphore,
@@ -513,7 +514,11 @@ func processFile(
             lineInstructions += "\nQuery annotation (example vocabulary and exclusions ONLY - a line answering the query without these words still passes):\n" + matchTest
         }
         let chunks: [[(number: Int, text: String)]]
-        if plan == .lines, let regex {
+        if plan == .lines, numeric != nil, regex == nil {
+            chunks = file.lines.enumerated()
+                .filter { !$0.element.trimmingCharacters(in: .whitespaces).isEmpty && numeric!.matches($0.element) }
+                .map { [($0.offset + 1, $0.element)] }
+        } else if plan == .lines, let regex {
             chunks = file.lines.enumerated()
                 .filter { !$0.element.trimmingCharacters(in: .whitespaces).isEmpty && regexHit($0.element, regex) }
                 .map { [($0.offset + 1, $0.element)] }
@@ -684,6 +689,7 @@ func processFile(
                           _ entries: [(number: Int, text: String)]) async -> Bool {
             if judged.contains(where: { $0.score > 0 }) { fileLive = true }
             for e in entries { judgedLines.insert(e.number) }
+            var pendingFloor: [(line: Int, score: Int)] = []
             var scores: [Int: Int] = [:]
             var reason = ""
             var quiet: [(line: Int, score: Int)] = []
@@ -691,8 +697,17 @@ func processFile(
                 let text = entries[v.pos].text
                 guard text.rangeOfCharacter(from: .alphanumerics) != nil else { return nil }
                 reason = v.reason
-                if v.score >= threshold {
-                    scores[v.pos + 1] = v.score
+                let score: Int
+                if let numeric, numeric.matches(text) {
+                    score = max(v.score, threshold)      // arithmetic, not opinion
+                    if options.debug, v.score < threshold {
+                        pendingFloor.append((entries[v.pos].number, v.score))
+                    }
+                } else {
+                    score = v.score
+                }
+                if score >= threshold {
+                    scores[v.pos + 1] = score
                     return v.pos + 1
                 }
                 if options.debug, v.score >= 1 { quiet.append((entries[v.pos].number, v.score)) }
@@ -729,6 +744,9 @@ func processFile(
                         }
                     }
                 }
+            }
+            for (line, sc) in pendingFloor {
+                await sink.warn("[debug] \(spec.display):\(line): kept despite score \(sc) because it satisfies \(numeric?.text ?? "")")
             }
             for (line, sc) in quiet {
                 let why = judged.first { entries[$0.pos].number == line }?.reason ?? ""
@@ -886,7 +904,13 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
     // filtered on, and nothing is skipped - files with no literal still get
     // swept exactly as they would have.
     var literals: [String] = []
-    if options.engine != .blocks, options.prefilter == nil, options.literalGate, pattern == nil {
+    var numeric: NumericRule?
+    if options.engine != .blocks, options.numericGate {
+        // Detected even alongside -E: the comparison is a fact about the lines,
+        // independent of which lines are being offered to the model.
+        numeric = NumericRule.detect(options.query)
+    }
+    if options.engine != .blocks, options.prefilter == nil, options.literalGate, pattern == nil, numeric == nil {
         literals = queryLiterals(options.query)
         if !literals.isEmpty {
             pattern = literals.map { "\\b" + NSRegularExpression.escapedPattern(for: $0) + "\\b" }
@@ -896,8 +920,12 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
     var plan: [Int: FilePlan] = [:]
     var lineCalls = 0, runCalls = 0, zeroSkipFiles = 0, literalFreeFiles = 0
     let expandedUsed = pattern != nil && literals.isEmpty   // model-guessed filter in play
+    if let numeric {
+        FileHandle.standardError.write("fmgrep: your query states a numeric condition (\(numeric.text)) - that is computed here, not asked of the model (\(numeric.text) means a line containing such a number is an answer)\n".data(using: .utf8)!)
+    }
     if options.engine != .blocks {
         let planRe = pattern.flatMap { try? NSRegularExpression(pattern: $0, options: [.caseInsensitive]) }
+        let planTest: ((String) -> Bool)? = numeric.map { rule in { rule.matches($0) } }
         for spec in files {
             guard let f = try? loadFile(spec, maxBytes: options.maxFileBytes), !f.lines.isEmpty else {
                 plan[spec.id] = .skip
@@ -919,6 +947,22 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
                         plan[spec.id] = .skip
                         zeroSkipFiles += 1
                     }
+                } else if m <= options.maxLineCallsPerFile {
+                    plan[spec.id] = .lines
+                    lineCalls += m
+                } else {
+                    plan[spec.id] = .runs
+                    runCalls += (m + options.matchedChunk - 1) / options.matchedChunk
+                }
+            } else if let planTest {
+                // Numeric condition: qualifying lines get judged one by one, and
+                // the condition itself is enforced in reportWindow, not here.
+                let m = f.lines.reduce(into: 0) { acc, line in
+                    if !line.trimmingCharacters(in: .whitespaces).isEmpty, planTest(line) { acc += 1 }
+                }
+                if m == 0 {
+                    plan[spec.id] = .runs
+                    runCalls += runs
                 } else if m <= options.maxLineCallsPerFile {
                     plan[spec.id] = .lines
                     lineCalls += m
@@ -970,7 +1014,7 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
     var tasks: [Task<Void, Never>] = []
     for spec in files {
         let task = Task(priority: .userInitiated) {
-            await processFile(spec, options: settled, matchTest: matchTest, plan: planDict[spec.id], pattern: patternStr, cache: cache, guard_: guard_, semaphore: semaphore, sink: sink)
+            await processFile(spec, options: settled, matchTest: matchTest, plan: planDict[spec.id], pattern: patternStr, numeric: numeric, cache: cache, guard_: guard_, semaphore: semaphore, sink: sink)
         }
         registry.register(task)
         tasks.append(task)

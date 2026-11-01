@@ -46,6 +46,7 @@ struct Options {
     var confirm = true             // batched YES answers get re-judged alone
     var recallSweep = true         // silent windows in a live file get re-swept smaller
     var literalGate = true         // an exact value in the query gates candidate lines
+    var numericGate = true         // a comparison in the query is evaluated in Swift
     var rerank = false             // opt-in comparative gate; measured to cost more recall
                                    // than precision on real code, so it is not the default
     var dumpPrompt = false         // print the exact prompt for each model call
@@ -129,6 +130,7 @@ struct Options {
                 case "rerank": o.rerank = true
                 case "no-rerank": o.rerank = false
                 case "no-literal": o.literalGate = false
+                case "no-numeric": o.numericGate = false
                 case "no-verify": o.verify = false
                 case "scratchpad": o.scratchpad = true
                 case "no-scratchpad": o.scratchpad = false
