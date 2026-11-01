@@ -44,6 +44,7 @@ Like grep: give it files (`-r` for directories) or pipe stdin, get
 | `--include` / `--exclude` GLOB | file filtering (skips `.git`, `node_modules`, … by default) |
 | `-E REGEX`, `--prefilter` | **hybrid mode:** runs/blocks whose text misses REGEX are dropped before the model sees them, and `-E` also gates triage (path + declarations miss the regex ⇒ file skipped, no model call). `--no-triage` restores exhaustive `-E` |
 | `--expand` | ask the model for candidate keywords and filter with them (opt-in: fast, recall capped by the guesses) |
+| `--group` | print hits under the declaration each lives in, with a flagged/total count per function — the readable form of a file that matched wholesale |
 | `--top N` | buffer every hit, print the best N ranked by model confidence — right mode for big corpora where streaming just prints whatever finished first |
 | (default) | engine: 32 consecutive lines per call as a **sieve**, then every line the batch vouches for is judged again alone before it is printed — line-grade answers at roughly 1/10 the calls |
 | `--line` | engine: strictly one call per line, nothing batched; the accuracy baseline, ~0.7–1 s/line |
@@ -224,6 +225,30 @@ unfinished.
 Numbers move by a line or two run to run — the same prompt on the same binary
 scored 10/11 and 8/11 on the two runs above. `--debug` prints the score-1 lines
 it dropped, which is where the difference lives.
+
+## Reading the output
+
+`--group` answers what a wall of line numbers cannot - *where is this stuff,
+structurally*:
+
+```console
+$ fmgrep --group -E deallocate "where are kernel memory objects handed back to the system" osfmk/vm/vm_kern.c
+/Users/unlink/audit/xnu/osfmk/vm/vm_kern.c
+  fn kmem_alloc_guard_internal  (1 of ~299 lines)
+    935:            vm_object_deallocate(object);
+  fn kmem_suballoc  (2 of ~102 lines)
+    1162:           vm_map_deallocate(map);
+    1163:           vm_map_deallocate(map); /* also removes ref to pmap */
+  fn copyinmap  (1 of ~29 lines)
+    4523:           vm_map_deallocate(map);
+```
+
+All 11 sites in 7 s, and the ratio is the useful half: `2 of ~102` is a function
+holding two answers, while `21 of ~65` - what the sleep-abandonment query reports
+for `_sleep_continue` - is the file matching rather than the question being
+answered. It is the degenerate-answer detector's number, made legible per
+function instead of only as a line on stderr. Buffered, so it prints when the
+scan finishes rather than streaming.
 
 ## What the honesty layer is for
 
