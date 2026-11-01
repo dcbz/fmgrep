@@ -304,46 +304,50 @@ actor CollapseGuard {
 /// happens: a bare `label:`, or one comma-separated tail of a multi-line
 /// declaration/argument list. Not vocabulary - pure syntax, so it cannot
 /// bias the search toward words the query happens to contain.
-func isStructuralTail(_ text: String, depthBefore: Int) -> Bool {
+/// nil = this line can be an answer; otherwise, which syntax rule excluded it.
+/// `cPreprocessor` matters: `#` introduces a directive in C but a COMMENT in
+/// Python, shell and YAML, and a comment can absolutely be the answer to a
+/// query ("where does it say why the retry is capped"). Treating every `#` line
+/// as inert would have been the vocabulary gate wearing a syntax costume.
+func isStructuralTail(_ text: String, depthBefore: Int, cPreprocessor: Bool) -> String? {
     let t = text.trimmingCharacters(in: .whitespaces)
-    // Preprocessor directives: nothing happens on these lines. `#define` stays
-    // judgeable because it really does declare the thing a query can ask about.
-    if t.hasPrefix("#"), !t.dropFirst().trimmingCharacters(in: .whitespaces).hasPrefix("define") {
-        return true
+    if cPreprocessor, t.hasPrefix("#"),
+       !t.dropFirst().trimmingCharacters(in: .whitespaces).hasPrefix("define") {
+        return "preprocessor directive"
     }
     // Control statements with no operands say nothing about any topic.
     for bare in ["break;", "break", "continue;", "continue", "fallthrough;", "OS_FALLTHROUGH;",
                  "OS_FALLTHROUGH"] where t.caseInsensitiveCompare(bare) == .orderedSame {
-        return true
+        return "control statement with no operands"
     }
     // Annotation-only lines: `__attribute__((noreturn))`, `@available(...)`.
     // The double paren is what keeps a real call like `kfree(ptr);` judgeable.
     if t.range(of: #"^[A-Za-z_]\w*\(\(.*\)\);?$"#, options: .regularExpression) != nil,
        !t.contains("=") {
-        return true
+        return "attribute-only line"
     }
     if t.range(of: #"^@?[A-Za-z_@$][\w$]*\([\w :,.*"]*\)[;]?$"#, options: .regularExpression) != nil,
        t.first == "@" {
-        return true
+        return "annotation"
     }
     // braces / `else` with no statement in them
     let bracesOnly = t.replacingOccurrences(of: "[{}()\\[\\];]", with: "", options: .regularExpression)
         .replacingOccurrences(of: "\\belse\\b", with: "", options: .regularExpression)
         .trimmingCharacters(in: .whitespaces)
-    if t.contains("{") || t.contains("}"), bracesOnly.isEmpty { return true }
+    if t.contains("{") || t.contains("}"), bracesOnly.isEmpty { return "braces only" }
     // a lone storage/type keyword: the header of a declaration that continues
     // on the next line, never itself a place where something happens
     let keyword = (t.hasSuffix(";") ? String(t.dropLast()) : t).trimmingCharacters(in: .whitespaces)
     if ["void", "int", "char", "unsigned", "signed", "long", "short", "float", "double",
         "static", "extern", "inline", "struct", "union", "enum", "bool", "_Bool",
         "public", "private", "protected", "internal", "func", "def", "sub"].contains(keyword) {
-        return true
+        return "lone type keyword"
     }
     if t.last == ":", t.count > 2, t.filter({ $0 == ":" }).count == 1,
        let colon = t.firstIndex(of: ":") {
         let head = t[..<colon].trimmingCharacters(in: .whitespaces)
         if !head.isEmpty, head.first!.isLetter, head.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }) {
-            return true // goto label: `block:` / `out:`
+            return "goto label"   // e.g. `block:` / `out:`
         }
     }
     if depthBefore > 0, t.hasSuffix(","), t.rangeOfCharacter(from: .alphanumerics) != nil {
@@ -352,10 +356,10 @@ func isStructuralTail(_ text: String, depthBefore: Int) -> Bool {
         let core = String(t.dropLast())
         if !core.contains("{"), !core.contains(";"), !core.contains("return"),
            !core.contains("=") || core.hasSuffix("=") {
-            return true
+            return "signature/argument continuation"
         }
     }
-    return false
+    return nil
 }
 
 /// Paren depth just before a line, over a bounded lookback window.
@@ -604,9 +608,12 @@ func processFile(
             if entries.count == 1 {
                 // short-circuit ladder: structural filter -> junk filter -> cache -> model.
                 let ln = entries[0].number
-                if isStructuralTail(entries[0].text, depthBefore: parenDepth(file.lines, before: ln - 1)) {
+                let cFam = ["c", "h", "m", "mm", "cpp", "cc", "cxx", "hpp", "pch", "metal"]
+                    .contains((spec.url?.pathExtension ?? "").lowercased())
+                if let why = isStructuralTail(entries[0].text, depthBefore: parenDepth(file.lines, before: ln - 1),
+                                            cPreprocessor: cFam) {
                     if options.debug {
-                        await sink.warn("[debug] \(spec.display):\(ln): structural tail (label or signature continuation) - not judged")
+                        await sink.warn("[debug] \(spec.display):\(ln): excluded by syntax, not vocabulary (\(why))")
                     }
                     return []
                 }
