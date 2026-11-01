@@ -150,6 +150,13 @@ calls, and the architecture fights for every call:
   files skipped with a count. Without `-E`: batched sweeps of everything,
   each batched yes confirmed per line, at an honest printed price.
 - **Triage (automatic):** multi-run files screened by path + declarations.
+- **Structure, not just lines.** The symbol map carves a file into functions so
+  a hit can be attributed to the one it lives in (`--group`), so blocks break at
+  declarations instead of mid-statement, and so the judging prompt can say
+  `inside fn _sleep_continue`. Getting there took three tries at C's definition
+  shapes: `name(` at end of line, `int foo(void) {` inline, and the kernel's
+  favourite `name( args )` with the brace still to come - until the last one was
+  matched, every hit in such a file reported "module level".
 - **Free filters before any model call:** lines with control or replacement
   characters, or more than 60% non-ASCII, are skipped as content-free; and
   syntax, never vocabulary, drops `goto` labels, brace-only lines and the

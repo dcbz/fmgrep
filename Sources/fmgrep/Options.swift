@@ -52,6 +52,7 @@ struct Options {
                                    // than precision on real code, so it is not the default
     var dumpPrompt = false         // print the exact prompt for each model call
     var top = 0                    // >0: buffer all hits, print best N by score
+    var group = false              // print hits gathered under the declaration each lives in
     var verify = false             // opt-in per-line re-check; prunes noise but also true hits (3B model)
     var debug = false              // per-line WHY: forces 1 line/call, prints score+reason per hit,
                                    // and reports score-1 lines the threshold suppressed (stderr)
@@ -97,6 +98,7 @@ struct Options {
             case "min-confidence": v = try value("--min-confidence"); o.minConfidence = try max(0, min(2, num(v, "--min-confidence")))
             case "max-count": v = try value("--max-count"); o.maxCount = try max(0, num(v, "--max-count"))
             case "top": v = try value("--top"); o.top = try max(0, num(v, "--top"))
+            case "group": o.group = true
             case "instructions": v = try value("--instructions"); o.instructionsOverride = v
             default: return false
             }
@@ -235,6 +237,13 @@ func printUsage() {
                                 annotates each hit with its score and the model's reason,
                                 and writes the score-1 lines the threshold dropped to stderr
                                 (recall debugging). Slow by construction
+          --group               print hits under the declaration they live in, with how
+                                many of that region's lines were flagged. A semantic
+                                search over a busy file returns dozens of lines that are
+                                each defensible and collectively unreadable; this turns
+                                "24 lines" into "4 of 9 exit paths in _sleep_continue"
+                                followed by the lines themselves. Buffered, so output
+                                arrives at the end rather than streaming.
           --top N               buffer every hit and print the best N ranked by
                                 model confidence (use on big corpora; default
                                 mode streams grep-style in completion order)

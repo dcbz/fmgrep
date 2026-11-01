@@ -66,6 +66,8 @@ struct ScoredMatch: Sendable {
     let text: String
     let quote: String
     let reason: String
+    var region: String = ""        // "func _sleep_continue", when the file has a symbol map
+    var regionLines: Int = 0       // how long that region is: "4 of 9 lines" is the signal
     let score: Int
 }
 
@@ -80,6 +82,7 @@ actor Sink {
     private var emittedLines = 0
     private var stopAll = false
     private var ranked: [ScoredMatch] = []    // buffered hits when --top is set
+    private var grouped: [ScoredMatch] = []   // buffered hits when --group is set
 
     init(options: Options, registry: TaskRegistry) {
         self.options = options
@@ -157,7 +160,8 @@ actor Sink {
 
     func hitCount(_ fileID: Int) -> Int { counts[fileID] ?? 0 }
 
-    func report(_ verdict: MatchVerdict, block: Block, display: String, scores: [Int: Int] = [:]) -> Bool {
+    func report(_ verdict: MatchVerdict, block: Block, display: String, scores: [Int: Int] = [:],
+                region: (name: String, lines: Int) = ("", 0)) -> Bool {
         var verdict = verdict
         if verdict.isMatch, verdict.confidence < (options.minConfidence ?? 1) {
             verdict.isMatch = false
@@ -208,6 +212,10 @@ actor Sink {
                 ))
             } else if options.json {
                 emitJSON(file: display, line: n, text: text, quote: verdict.quote, reason: verdict.reason)
+            } else if options.group {
+                grouped.append(ScoredMatch(display: display, line: n, text: text,
+                                          quote: verdict.quote, reason: verdict.reason,
+                                          region: region.name, regionLines: region.lines, score: 200))
             } else {
                 var why: String?
                 if options.debug {
@@ -245,7 +253,44 @@ actor Sink {
     }
 
     /// Final pass: ranked --top output, -c lines, -v listings. Returns whether anything was printed.
+    /// Hits ordered by where they live rather than by the order they finished.
+    /// The count per region is the useful part: it says whether a function holds a
+    /// couple of answers or whether the whole file simply matched, which is the
+    /// difference between a result set and a wall of text.
+    private func printGrouped() -> Bool {
+        guard !grouped.isEmpty else { return false }
+        var byFile: [(String, [ScoredMatch])] = []
+        for m in grouped {
+            if let i = byFile.firstIndex(where: { $0.0 == m.display }) { byFile[i].1.append(m) }
+            else { byFile.append((m.display, [m])) }
+        }
+        for entry in byFile {
+            printer.plain(entry.0)
+            var byRegion: [(String, [ScoredMatch])] = []
+            for m in entry.1.sorted(by: { $0.line < $1.line }) {
+                let key = m.region.isEmpty ? "module level" : m.region
+                if let i = byRegion.firstIndex(where: { $0.0 == key }) { byRegion[i].1.append(m) }
+                else { byRegion.append((key, [m])) }
+            }
+            for r in byRegion {
+                let span = r.1.first?.regionLines ?? 0
+                let note = span > 0 ? "  (\(r.1.count) of ~\(span) lines)" : ""
+                printer.plain("  \(r.0)\(note)")
+                for m in r.1 {
+                    var row = "    "
+                    if options.lineNumbers { row += printer.paint("32", "\(m.line)") + ":" }
+                    row += m.text
+                    printer.plain(row)
+                }
+            }
+        }
+        return true
+    }
+
     func finish(files: [FileSpec]) -> Bool {
+        if options.group {
+            if printGrouped() { return true }
+        }
         var printed = false
         if !ranked.isEmpty {
             for m in ranked.sorted(by: { $0.score != $1.score ? $0.score > $1.score : ($0.display != $1.display ? $0.display < $1.display : $0.line < $1.line) }).prefix(options.top) {
@@ -569,6 +614,7 @@ func processFile(
     // one-line-per-call. Each answer is a binary per-line decision - the
     // per-line prompt shape, at 1/32 the calls.
     let predLines: Set<Int> = pred == nil ? [] : await pred!.lines(spec.id)
+    let regions = options.symbols ? Symbols.regions(file.symbols, lineCount: file.lines.count) : []
 
     if options.engine != .blocks || plan != nil {
         var lineInstructions = options.instructionsOverride ?? defaultRunInstructions
@@ -852,7 +898,9 @@ func processFile(
                 isMatch: !hits.isEmpty, lineNumbers: hits, quote: "",
                 reason: reason, confidence: hits.isEmpty ? 0 : 2, note: ""
             )
-            return await sink.report(verdict, block: block, display: spec.display, scores: scores)
+            let at = hits.first.map { entries[$0 - 1].number } ?? entries.first?.number ?? 1
+            return await sink.report(verdict, block: block, display: spec.display, scores: scores,
+                                     region: Symbols.regionName(at, regions))
         }
 
         for entries in chunks {
@@ -1222,7 +1270,7 @@ func runScan(options: Options, files: [FileSpec]) async -> Int32 {
         let dull = await guard_.degenerate()
         if !dull.isEmpty {
             let worst = dull.prefix(3).map { "\($0.file.split(separator: "/").last.map(String.init) ?? $0.file) \($0.hits)/\($0.lines) lines" }.joined(separator: ", ")
-            FileHandle.standardError.write("fmgrep: note: \(dull.count) file(s) answered yes on >8% of their lines (\(worst)) - that is the model calling the whole file relevant, not a result set. Scope with -E, or read --top N.\n".data(using: .utf8)!)
+            FileHandle.standardError.write("fmgrep: note: \(dull.count) file(s) answered yes on >8% of their lines (\(worst)) - that is the model calling the whole file relevant, not a result set. Scope with -E, read --top N, or --group to see them by function.\n".data(using: .utf8)!)
         }
         if g.reswept > 0 {
             FileHandle.standardError.write("fmgrep: recall guard: \(g.reswept) windows in matched files re-swept smaller (+\(g.resweepCalls) calls); --no-recall-sweep to skip\n".data(using: .utf8)!)

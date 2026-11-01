@@ -47,6 +47,12 @@ enum Symbols {
             // Kernel style: the return type sits on the previous line, so the
             // definition is just `name(` at end of line.
             Decl(re: re(#"^([a-z_]\w*)\s*\($"#)!, kindGroup: nil, nameGroups: [1], fixedKind: "fn"),
+            // ...or the whole parameter list follows on that same line, with the
+            // brace still to come: `_sleep_continue( __unused void *p, int w)`.
+            // This shape was unmatched, which made every hit in such a file report
+            // "module level" - the grouping feature looked broken until the parser
+            // wasn't. The lookahead keeps `if (x)` from declaring a function named if.
+            Decl(re: re(#"^(?!(?:if|while|for|switch|return|do|else|case|sizeof)\s*\()([a-z_]\w*)\s*\([^;()]*\)$"#)!, kindGroup: nil, nameGroups: [1], fixedKind: "fn"),
             // `int foo(int x)` / `int foo(` with the type inline. The bare-name
             // form above cannot be expressed with the `[A-Za-z_][\w ]*\b(name)`
             // idiom, which only matches when a space separates type and name.
@@ -112,6 +118,29 @@ enum Symbols {
             s += piece
         }
         return s.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Contiguous regions the declarations carve the file into, so a hit can be
+    /// attributed to the function it lives in without rescanning the symbol list
+    /// per line. `lines` is how long the region is, which is what makes
+    /// "4 of 9 lines flagged" a meaningful precision signal.
+    static func regions(_ symbols: [Symbol], lineCount: Int) -> [(start: Int, end: Int, name: String, lines: Int)] {
+        let marks = symbols.filter { regionKinds.contains($0.kind) }.sorted { $0.line < $1.line }
+        guard !marks.isEmpty else { return [(1, lineCount, "module level", lineCount)] }
+        var out: [(start: Int, end: Int, name: String, lines: Int)] = []
+        if marks[0].line > 1 {
+            out.append((1, marks[0].line - 1, "module level", marks[0].line - 1))
+        }
+        for (i, m) in marks.enumerated() {
+            let end = i + 1 < marks.count ? marks[i + 1].line - 1 : lineCount
+            out.append((m.line, end, "\(m.kind) \(m.name)", max(1, end - m.line + 1)))
+        }
+        return out
+    }
+
+    static func regionName(_ line: Int, _ regions: [(start: Int, end: Int, name: String, lines: Int)]) -> (name: String, lines: Int) {
+        for r in regions.reversed() where r.start <= line { return (r.name, r.lines) }
+        return ("", 0)
     }
 
     /// Human description of where a block sits, e.g. "inside func parseLiveOptions, declared at line 53".
